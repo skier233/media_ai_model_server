@@ -13,6 +13,7 @@ from lib.model.python_model import PythonModel
 from lib.model.video_preprocessor import VideoPreprocessorModel
 from lib.model.image_preprocessor import ImagePreprocessorModel
 from lib.model.audio_preprocessor import AudioPreprocessorModel
+from lib.model.ai_shot_boundary_model import AIShotBoundaryModel
 from lib.utils.vram_budget import compute_batch_sizes
 
 
@@ -92,6 +93,11 @@ class ModelManager:
                 return model_processor
             case "audio_preprocessor":
                 return ModelProcessor(AudioPreprocessorModel(model_config))
+            case "shot_boundary":
+                model_processor = ModelProcessor(AIShotBoundaryModel(model_config))
+                self.ai_models.append(model_processor)
+                self._rescale_legacy_batch_sizes()
+                return model_processor
             case _:
                 raise ValueError(f"Model type {model_config['type']} not recognized!")
 

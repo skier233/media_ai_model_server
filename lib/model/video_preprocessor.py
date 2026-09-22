@@ -70,6 +70,11 @@ class VideoPreprocessorModel(Model):
 
         # Populated by the dynamic_ai_manager at pipeline construction.
         self.specs: list[PreprocessSpec] = []
+        # Config/file names of the models fed by this preprocessor, injected by
+        # DynamicAIManager so the decode can be skipped when none of them will
+        # run for a request. None means "not wired by the dynamic manager", and
+        # is distinct from an empty set, which means "nothing downstream at all".
+        self.downstream_model_names = None
 
         # Cap how many preprocessed frames can be in-flight before the
         # preprocessor pauses to let inference catch up.  Preprocessed frames
@@ -151,6 +156,25 @@ class VideoPreprocessorModel(Model):
                     self._gpu_min_long_edge,
                 )
 
+    def _should_skip_decode(self, itemFuture, input_names) -> bool:
+        """True when no model downstream of this preprocessor will run."""
+        downstream = self.downstream_model_names
+        if downstream is None:
+            return False
+        if not downstream:
+            # No frame-scope model is active at all (e.g. a deployment with only
+            # an asset-scope model installed): nothing can consume these frames.
+            return True
+        requested = None
+        for name in ("dynamic_requested_model_names", "requested_model_names"):
+            if name in input_names and name in itemFuture.data:
+                requested = itemFuture[name]
+                break
+        if not requested:
+            return False
+        normalized = {str(value).strip() for value in requested if str(value).strip()}
+        return bool(normalized) and normalized.isdisjoint(downstream)
+
     async def worker_function(self, data):
         for item in data:
             try:
@@ -160,6 +184,21 @@ class VideoPreprocessorModel(Model):
                 use_timestamps = itemFuture[item.input_names[1]]
                 frame_interval = itemFuture[item.input_names[2]] or self.frame_interval
                 vr_video = itemFuture[item.input_names[5]]
+
+                # Nothing downstream will run for this request, so decoding the
+                # video would produce thousands of child futures that all resolve
+                # to Skip(). The per-model skip gate cannot prevent this: it only
+                # applies to AI models, and a preprocessor is not one. Return an
+                # empty child list before the "no frames" guard below, which
+                # would otherwise treat this as a decode failure.
+                if self._should_skip_decode(itemFuture, item.input_names):
+                    self.logger.info(
+                        "Skipping video decode for '%s': no requested model uses this preprocessor.",
+                        input_data,
+                    )
+                    await itemFuture.set_data(item.output_names[0], [])
+                    continue
+
                 children = []
                 frame_count = 0
                 preprocess_callable = self._preprocess_callable

@@ -61,6 +61,45 @@ async def result_coalescer(data):
             result["_errors"] = structured_errors
         await itemFuture.set_data(item.output_names[0], result)
         
+async def asset_result_collector(data):
+    """Collect asset-scope model outputs into one dict on the parent future.
+
+    A sibling of :func:`result_coalescer` for the asset stage.  ``input_names[0]``
+    is the asset path and acts purely as a trigger, so the stage still completes
+    — with an empty result — on the common deployment that has no asset-scope
+    model installed at all.  It is deliberately excluded from the result, which
+    is why this cannot just reuse ``result_coalescer``.
+    """
+    for item in data:
+        itemFuture = item.item_future
+        result = {}
+        structured_outputs = []
+        structured_errors = []
+        for input_name in item.input_names[1:]:
+            ai_result = itemFuture[input_name]
+            if isinstance(ai_result, Skip):
+                skipped = {"model_step": input_name, "status": "skipped"}
+                if getattr(ai_result, "reason", None):
+                    skipped["reason"] = ai_result.reason
+                structured_outputs.append(skipped)
+                continue
+
+            if isinstance(ai_result, Exception):
+                error_text = str(ai_result) or type(ai_result).__name__
+                structured_outputs.append(
+                    {"model_step": input_name, "status": "error", "error": error_text}
+                )
+                structured_errors.append({"model_step": input_name, "error": error_text})
+                continue
+
+            result[input_name] = ai_result
+            structured_outputs.append({"model_step": input_name, "status": "ok"})
+
+        result["_outputs"] = structured_outputs
+        if structured_errors:
+            result["_errors"] = structured_errors
+        await itemFuture.set_data(item.output_names[0], result)
+
 async def result_finisher(data):
     for item in data:
         itemFuture = item.item_future
@@ -415,7 +454,43 @@ async def video_result_postprocessor_v4(data):
             "frames": normalized_frames,
             "metrics": metrics,
         }
+        _apply_asset_results(
+            payload,
+            itemFuture[item.input_names[3]] if len(item.input_names) > 3 else None,
+            capability_index,
+        )
         await itemFuture.set_data(item.output_names[0], payload)
+
+
+def _apply_asset_results(payload, asset_results, capability_index):
+    """Lift asset-scope stage output onto the response as a top-level ``analysis``.
+
+    Whole-asset results are not frame data, so they do not belong under
+    ``frames``.  They are emitted with exactly the shape the image pipeline
+    already uses for its asset-level analysis, so a client needs one code path
+    for both: known capabilities bucket under ``analysis.capabilities``, and
+    anything else (temporal segmentation included) under ``analysis.other``.
+
+    The key is absent when the stage did not run, so a caller can tell "not
+    requested" from "ran and found nothing".
+    """
+    if not isinstance(asset_results, dict):
+        return
+
+    values = {
+        key: value
+        for key, value in asset_results.items()
+        if not str(key).startswith("_") and not isinstance(value, Skip)
+    }
+    if values:
+        payload["analysis"] = _normalize_analysis_payload(values, capability_index)
+
+    outputs = list(asset_results.get("_outputs") or [])
+    errors = list(asset_results.get("_errors") or [])
+    if outputs:
+        payload.setdefault("asset_outputs", outputs)
+    if errors:
+        payload.setdefault("asset_errors", errors)
 
 
 async def audio_result_postprocessor_v4(data):

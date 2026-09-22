@@ -42,16 +42,20 @@ class PythonModel:
         """Run model without sigmoid, respecting keep_on_device setting."""
         return self.run_model(input_tensor, False)
 
-    def run_raw_multi_output(self, input_tensor):
+    def run_raw_multi_output(self, input_tensor, use_half=True):
         """Run model returning all output heads as a list of numpy arrays.
         For multi-output models (e.g. face detection).
+
+        ``use_half=False`` keeps the input dtype and disables autocast, for
+        architectures that are not numerically safe in fp16 (transformer
+        models with sinusoidal position encodings overflow in half).
         """
         import numpy as np
         input_tensor = input_tensor.to(self.device)
-        if input_tensor.dtype != torch.float16:
+        if use_half and input_tensor.dtype != torch.float16:
             input_tensor = input_tensor.half()
         with torch.no_grad():
-            with torch.autocast(self.device.type, enabled=True):
+            with torch.autocast(self.device.type, enabled=use_half):
                 outputs = self.model(input_tensor)
         if isinstance(outputs, torch.Tensor):
             outputs = (outputs,)

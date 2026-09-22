@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
+from lib.model.whole_asset import is_whole_asset_model
+
 
 _SELECTOR_KEYS = {
     "capability",
@@ -58,6 +60,10 @@ class ModelCapabilitiesConfig:
         for pipeline_name, raw_entry in list(self.config.items()):
             if not isinstance(raw_entry, dict):
                 continue
+            # Before the selector check: the shipped video pipeline selects its
+            # detector and region models by capability, which must not leave an
+            # explicit asset_models list naming an inactive model unpruned.
+            self._prune_asset_models(pipeline_name, raw_entry)
             if _contains_selector(raw_entry):
                 continue
 
@@ -159,6 +165,34 @@ class ModelCapabilitiesConfig:
                 else:
                     raw_entry["full_image_models"] = available
 
+    def _prune_asset_models(self, pipeline_name, raw_entry):
+        """Drop the names in an explicit asset_models list that are not active.
+
+        Selector items stay: they are resolved later against the loaded models.
+        Unlike full_image_models, an emptied list stays empty: the listed
+        whole-video models were chosen deliberately, and falling back to ALL
+        would start running others.
+        """
+        asset_raw = raw_entry.get("asset_models", None)
+        if not isinstance(asset_raw, list):
+            return
+        kept = []
+        for item in asset_raw:
+            if not isinstance(item, str):
+                kept.append(item)
+                continue
+            name = item.strip()
+            if not name:
+                continue
+            if name in self.active_model_library:
+                kept.append(name)
+            else:
+                self.logger.warning(
+                    f"model_capabilities: pipeline '{pipeline_name}' asset_models references "
+                    f"'{name}' which is not in active_ai_models - removing."
+                )
+        raw_entry["asset_models"] = kept
+
     def validate(self):
         if not isinstance(self.config, dict):
             raise ValueError("model_capabilities config must be a mapping of pipeline_name -> capability settings")
@@ -180,6 +214,8 @@ class ModelCapabilitiesConfig:
             self._validate_reference_value(raw_entry.get("detector_models", []), allow_all=False)
             if "audio_models" in raw_entry:
                 self._validate_reference_value(raw_entry.get("audio_models"), allow_all=True)
+            if "asset_models" in raw_entry:
+                self._validate_reference_value(raw_entry.get("asset_models"), allow_all=True)
             self._validate_region_models(pipeline_name, raw_entry.get("region_models", {}) or {})
 
     def resolve_full_image_model_names_for_validation(self, pipeline_name: str) -> List[str]:
@@ -232,6 +268,12 @@ class ModelCapabilitiesConfig:
                 return None
             resolved = self._resolve_audio_model_names(audio_models, available_models)
             return resolved
+
+        if stage_name == "asset":
+            # A missing key means every whole-asset model, never "no
+            # constraint": entries written before the asset stage existed must
+            # not wire frame models into it.
+            return self._resolve_asset_model_names(entry.get("asset_models", "ALL"), available_models)
 
         return None
 
@@ -343,6 +385,30 @@ class ModelCapabilitiesConfig:
     _FULL_IMAGE_CAPABILITIES = {"tagging", "embedding"}
 
     _AUDIO_CAPABILITIES = {"embedding", "classification"}
+
+    def _resolve_asset_model_names(self, raw_value: Any, available_models: Optional[Sequence[Any]]) -> List[str]:
+        if _is_all_token(raw_value):
+            return self._resolve_all_asset_model_names(available_models, exclude_names=[])
+        if _is_all_config(raw_value):
+            exclude_names = _normalize_string_list(raw_value.get("exclude", []))
+            return self._resolve_all_asset_model_names(available_models, exclude_names=exclude_names)
+        return self._resolve_reference_names(raw_value, available_models)
+
+    def _resolve_all_asset_model_names(
+        self, available_models: Optional[Sequence[Any]], exclude_names: Iterable[str]
+    ) -> List[str]:
+        if not available_models:
+            return []
+
+        excluded = set(exclude_names)
+        resolved = []
+        for model in available_models:
+            model_name = _get_model_config_name(model)
+            if not model_name or model_name in excluded:
+                continue
+            if is_whole_asset_model(model):
+                resolved.append(model_name)
+        return resolved
 
     def _resolve_audio_model_names(self, raw_value: Any, available_models: Optional[Sequence[Any]]) -> List[str]:
         if _is_all_token(raw_value):

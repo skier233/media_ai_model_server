@@ -100,6 +100,8 @@ class CustomPipelineRequestV4(BaseModel):
     region_models: Dict[str, List[str]] | None = None
     use_all_audio_models: bool = False
     audio_models: List[str] | None = None
+    use_all_asset_models: bool = True
+    asset_models: List[str] | None = None
 
 class OptimizeMarkerSettings(BaseModel):
     existing_json_data: Any = None

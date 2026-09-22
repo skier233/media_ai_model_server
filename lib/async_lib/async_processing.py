@@ -4,6 +4,7 @@ import time
 
 from lib.model.ai_model import AIModel
 from lib.model.skip_input import Skip
+from lib.model.whole_asset import is_whole_asset_model
 
 logger = logging.getLogger("logger")
 
@@ -106,44 +107,73 @@ class ModelProcessor():
         self.stopped = False
         
     async def add_to_queue(self, data):
+        # Skips are decided before queueing. A model that will not run for this
+        # item must not make it wait behind the items queued ahead of it: for a
+        # single-worker model busy with a whole-video analysis that is minutes,
+        # and a full queue would block the request that created the item.
+        if await self._complete_if_skipped(data):
+            return
         await self.queue.put(data)
 
     async def add_items_to_queue(self, data):
         for item in data:
+            if await self._complete_if_skipped(item):
+                continue
             await self.queue.put(item)
 
-    async def complete_item(self, item):
+    async def complete_item(self, item, reason=None):
         for output in item.output_names:
-            await item.item_future.set_data(output, Skip())
+            await item.item_future.set_data(output, Skip(reason))
+
+    def _skip_reason(self, item):
+        """Why this model should not run for ``item``, or None if it should."""
+        if not self.is_ai_model:
+            return None
+        skipped_categories = _resolve_optional_future_value(
+            item.item_future,
+            item.input_names,
+            ["dynamic_skipped_categories", "skipped_categories"],
+        )
+        if skipped_categories is not None:
+            this_ai_categories = self.model.model_category or []
+            if this_ai_categories and all(this_category in skipped_categories for this_category in this_ai_categories):
+                return "category_skipped"
+
+        requested_model_names = _resolve_optional_future_value(
+            item.item_future,
+            item.input_names,
+            ["dynamic_requested_model_names", "requested_model_names"],
+        )
+        if requested_model_names:
+            normalized_requested = {str(name).strip() for name in requested_model_names if str(name).strip()}
+            candidate_names = {
+                str(getattr(self.model, "config_name", "") or "").strip(),
+                str(getattr(self.model, "model_file_name", "") or "").strip(),
+            }
+            candidate_names.discard("")
+            if candidate_names and candidate_names.isdisjoint(normalized_requested):
+                return "not_requested"
+        elif is_whole_asset_model(self.model) and _has_future_value_slot(
+            item.item_future, item.input_names, ["dynamic_requested_model_names", "requested_model_names"]
+        ):
+            # A request that names no models (the legacy endpoints, or /v4
+            # without `want`) means "the usual per-frame analysis". A
+            # whole-asset model decodes every frame of the video itself, so it
+            # runs only when a request asks for it by name. A stage that is not
+            # given the requested names at all is not gated.
+            return "not_named"
+        return None
+
+    async def _complete_if_skipped(self, item):
+        reason = self._skip_reason(item)
+        if reason is None:
+            return False
+        await self.complete_item(item, reason)
+        return True
 
     async def batch_data_append_with_skips(self, batch_data, item):
-        if self.is_ai_model:
-            skipped_categories = _resolve_optional_future_value(
-                item.item_future,
-                item.input_names,
-                ["dynamic_skipped_categories", "skipped_categories"],
-            )
-            if skipped_categories is not None:
-                this_ai_categories = self.model.model_category or []
-                if this_ai_categories and all(this_category in skipped_categories for this_category in this_ai_categories):
-                    await self.complete_item(item)
-                    return True
-
-            requested_model_names = _resolve_optional_future_value(
-                item.item_future,
-                item.input_names,
-                ["dynamic_requested_model_names", "requested_model_names"],
-            )
-            if requested_model_names:
-                normalized_requested = {str(name).strip() for name in requested_model_names if str(name).strip()}
-                candidate_names = {
-                    str(getattr(self.model, "config_name", "") or "").strip(),
-                    str(getattr(self.model, "model_file_name", "") or "").strip(),
-                }
-                candidate_names.discard("")
-                if candidate_names and candidate_names.isdisjoint(normalized_requested):
-                    await self.complete_item(item)
-                    return True
+        if await self._complete_if_skipped(item):
+            return True
         batch_data.append(item)
         return False
 
@@ -255,6 +285,17 @@ class ModelProcessor():
                 metrics = {}
                 setattr(root_future, "_pipeline_metrics", metrics)
             metrics["ai_inference_seconds"] = metrics.get("ai_inference_seconds", 0.0) + (elapsed * (count / total_items))
+
+
+def _has_future_value_slot(item_future, input_names, preferred_keys):
+    """Whether the item carries one of ``preferred_keys`` at all, even as None."""
+    data = getattr(item_future, "data", None) or {}
+    if any(key in data for key in preferred_keys):
+        return True
+    return any(
+        input_name in data and any(input_name == key or input_name.endswith(key) for key in preferred_keys)
+        for input_name in input_names
+    )
 
 
 def _resolve_optional_future_value(item_future, input_names, preferred_keys):

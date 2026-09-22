@@ -13,6 +13,7 @@ image_pipeline_dynamic_v4:
           scopes: [region]
 video_pipeline_dynamic_v4:
   full_image_models: ALL
+  asset_models: ALL
   detector_models:
     - capabilities: [detection]
       categories: [face_detections]

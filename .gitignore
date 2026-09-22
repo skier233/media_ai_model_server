@@ -161,6 +161,8 @@ TODO.txt
 /temp2
 nsfw_ai_model_server/
 /config/models/*
+# Pipeline glue configs are code, not downloaded model configs — keep them tracked.
+!/config/models/asset_result_collector.yaml
 models/.ai_license_fingerprint
 
 # Docker

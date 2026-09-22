@@ -40,9 +40,11 @@ class Pipeline:
             if not model["name"]:
                 raise ValueError("Error: Model name must be a non-empty string!")
             modelName = model["name"]
-            if modelName in ["dynamic_video_ai", "dynamic_image_ai", "dynamic_region_ai", "dynamic_audio_ai", "dynamic_ai"]:
+            if modelName in ["dynamic_video_ai", "dynamic_image_ai", "dynamic_region_ai", "dynamic_audio_ai", "dynamic_asset_ai", "dynamic_ai"]:
                 if modelName == "dynamic_video_ai":
                     dynamic_models = dynamic_ai_manager.get_dynamic_video_ai_models(model["inputs"], model["outputs"], pipeline_name=pipeline_name)
+                elif modelName == "dynamic_asset_ai":
+                    dynamic_models = dynamic_ai_manager.get_dynamic_asset_ai_models(model["inputs"], model["outputs"], pipeline_name=pipeline_name)
                 elif modelName == "dynamic_image_ai":
                     dynamic_models = dynamic_ai_manager.get_dynamic_image_ai_models(model["inputs"], model["outputs"], pipeline_name=pipeline_name)
                 elif modelName == "dynamic_region_ai":

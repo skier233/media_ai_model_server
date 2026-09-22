@@ -9,7 +9,7 @@ inputs:
   - requested_model_names
 output: results
 short_name: dynamic_video_v4
-version: 4.0
+version: 4.1
 
 models:
   - name: dynamic_video_ai
@@ -24,10 +24,22 @@ models:
       - requested_model_names
     outputs:
       - childrenResults
+  # Asset-scope models see the whole asset instead of individual frames
+  # (e.g. temporal segmentation). The stage completes with an empty result
+  # when no asset-scope model is installed, which is the common case.
+  - name: dynamic_asset_ai
+    inputs:
+      - video_path
+      - vr_video
+      - skipped_categories
+      - requested_model_names
+    outputs:
+      - assetResults
   - name: video_result_postprocessor_v4
     inputs:
       - childrenResults
       - video_path
       - time_interval
+      - assetResults
     outputs:
       - results
