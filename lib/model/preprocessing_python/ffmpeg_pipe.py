@@ -100,10 +100,13 @@ class ScalePlan:
     ``gpu_steps`` are aspect-preserving halvings applied with ``scale_cuda``;
     ``target`` is the exact output size, reached by one last, small,
     aspect-breaking step with swscale (or on the GPU when there is no halving).
+    ``crop`` is an ``(x, y, width, height)`` region of the source taken before
+    any scaling, e.g. one eye of a VR frame; the plan is made from its size.
     """
 
     target: Optional[tuple]
     gpu_steps: tuple = ()
+    crop: Optional[tuple] = None
 
     @property
     def is_noop(self) -> bool:
@@ -256,24 +259,29 @@ def _even_up(value: int) -> int:
     return (value + 1) & ~1
 
 
-def plan_scale(src_width: int, src_height: int, decode_size, quality: str = "exact") -> ScalePlan:
+def plan_scale(src_width: int, src_height: int, decode_size, quality: str = "exact",
+               crop: Optional[tuple] = None) -> ScalePlan:
     """Plan the descent from the source geometry to an exact target size.
 
     ``quality="exact"`` halves on the GPU until within 2x of the target so the
     final swscale step matches a pure software pipeline. ``quality="fast"``
     goes straight there in one GPU step, which is quicker and aliases.
+    With ``crop``, the cropped region is what gets scaled.
     """
+    crop = tuple(int(value) for value in crop) if crop else None
+    if crop:
+        src_width, src_height = crop[2], crop[3]
     if not decode_size:
-        return ScalePlan(target=None)
+        return ScalePlan(target=None, crop=crop)
 
     target_width, target_height = int(decode_size[0]), int(decode_size[1])
     if target_width <= 0 or target_height <= 0:
-        return ScalePlan(target=None)
+        return ScalePlan(target=None, crop=crop)
     if (src_width, src_height) == (target_width, target_height):
-        return ScalePlan(target=None)
+        return ScalePlan(target=None, crop=crop)
 
     if quality == "fast":
-        return ScalePlan(target=(target_width, target_height))
+        return ScalePlan(target=(target_width, target_height), crop=crop)
 
     steps = []
     width, height = src_width, src_height
@@ -290,7 +298,20 @@ def plan_scale(src_width: int, src_height: int, decode_size, quality: str = "exa
         if width <= target_width and height <= target_height:
             break
 
-    return ScalePlan(target=(target_width, target_height), gpu_steps=tuple(steps))
+    return ScalePlan(target=(target_width, target_height), gpu_steps=tuple(steps), crop=crop)
+
+
+def vr_crop_rect(width: int, height: int) -> tuple:
+    """The ``(x, y, width, height)`` region ``vr_permute`` keeps of a VR frame.
+
+    A 180-degree side-by-side frame (wider than 1.5:1) keeps its right half; a
+    360-degree frame keeps the top half's centre 50%. Integer arithmetic
+    matches ``vr_permute``'s slicing exactly, so doing the crop in ffmpeg
+    selects the same source pixels as cropping a decoded frame in Python.
+    """
+    if width / height > 1.5:
+        return (width // 2, 0, width - width // 2, height)
+    return (width // 4, 0, 3 * width // 4 - width // 4, height // 2)
 
 
 def build_filter_chain(plan: ScalePlan, frame_step: int, hw: bool) -> str:
@@ -300,6 +321,16 @@ def build_filter_chain(plan: ScalePlan, frame_step: int, hw: bool) -> str:
         # A frame modulo, never `fps=`: the latter resamples to a wall-clock
         # rate and so changes the frame count on VFR sources.
         parts.append(f"select='not(mod(n\\,{frame_step}))'")
+
+    if plan.crop:
+        if hw:
+            # Frames are still CUDA surfaces here; the caller refuses NVDEC
+            # for cropped sources rather than download them at full size.
+            raise ValueError("a cropped source is decoded in software")
+        x, y, width, height = plan.crop
+        # exact=1: without it a 4:2:0 source has odd offsets rounded down,
+        # which would select different pixels than vr_permute does.
+        parts.append(f"crop={width}:{height}:{x}:{y}:exact=1")
 
     if hw:
         for index, (width, height) in enumerate(plan.gpu_steps):
@@ -349,7 +380,7 @@ def build_command(
         if device_index is not None:
             command += ["-hwaccel_device", str(device_index)]
     # Decode the stored frames as they are, like PyAV does: autorotation would
-    # hand a rotated clip to the model.
+    # hand a rotated clip to the model, and rotate a VR frame before its crop.
     command += ["-noautorotate", "-i", str(video_path)]
     # passthrough keeps ffmpeg from duplicating or dropping frames to hit a rate.
     command += ["-fps_mode", "passthrough"] if has_fps_mode else ["-vsync", "passthrough"]
@@ -476,6 +507,12 @@ def _iter_pyav_frames(video_path, plan: ScalePlan, frame_step: int) -> Iterator[
         for index, frame in enumerate(container.decode(video=0)):
             if frame_step > 1 and (index % frame_step) != 0:
                 continue
+            if plan.crop:
+                # PyAV cannot crop, so round-trip one frame through RGB. Only
+                # the fallback pays this, and only one frame is held at a time.
+                x, y, width, height = plan.crop
+                region = frame.to_ndarray(format="rgb24")[y:y + height, x:x + width]
+                frame = av.VideoFrame.from_ndarray(np.ascontiguousarray(region), format="rgb24")
             if plan.is_noop:
                 yield frame.to_ndarray(format="rgb24")
             else:
@@ -524,16 +561,23 @@ def make_video_frame_source(
     quality: str = "exact",
     device_index: Optional[int] = None,
     info: Optional[VideoInfo] = None,
+    crop: Optional[tuple] = None,
 ) -> FrameSource:
     """Open the fastest usable decode for this source.
 
     Tries the backends of ``backend``'s ladder in order (see ``_ladder``; NVDEC
     only when asked for). Every check runs before a single frame is produced,
     so a failure here is recoverable.
+    ``crop`` (x, y, width, height) is applied to the source before scaling.
     """
     info = info or probe_video(video_path)
-    plan = plan_scale(info.width, info.height, decode_size, quality)
-    width, height = (plan.target if not plan.is_noop else (info.width, info.height))
+    plan = plan_scale(info.width, info.height, decode_size, quality, crop=crop)
+    if not plan.is_noop:
+        width, height = plan.target
+    elif plan.crop:
+        width, height = plan.crop[2], plan.crop[3]
+    else:
+        width, height = info.width, info.height
 
     for rung in _ladder(backend):
         try:
@@ -587,6 +631,8 @@ def _open(rung, video_path, info, plan, frame_step, width, height, device_index)
 
     hw = rung == _BACKEND_FFMPEG_CUDA
     if hw:
+        if plan.crop:
+            raise DecodeSetupError("cropped sources are decoded in software")
         if not features.has_cuda:
             raise DecodeSetupError("this ffmpeg was built without CUDA support")
         if not features.has_scale_cuda:

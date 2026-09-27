@@ -26,19 +26,23 @@ model-independent.
 
 import asyncio
 import json
+import queue
+import threading
 import time
 from collections import Counter
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, List, Optional
 
+import numpy as np
 import torch
 
 from lib.model.ai_model import AIModel
 from lib.model.preprocessing_python.ffmpeg_pipe import (
     make_video_frame_source,
     probe_video,
+    vr_crop_rect,
 )
-from lib.model.preprocessing_python.image_preprocessing import _validate_local_video_source, vr_permute
+from lib.model.preprocessing_python.image_preprocessing import _validate_local_video_source
 from lib.pipeline.preprocess_spec import PreprocessSpec, apply_spec_batch
 
 # NORMALIZATION_PRESETS key of the ImageNet mean/std the artifacts are trained with.
@@ -268,71 +272,72 @@ class AIShotBoundaryModel(AIModel):
 
         # Rolling window over the padded frame stream. OmniShotCut's reference
         # implementation prepends `context` black frames to the whole video,
-        # then walks windows of `window` frames at `stride`. Holding only one
-        # window at a time keeps peak memory at window*C*H*W regardless of
-        # video length; with vr_video, H*W is one eye at source resolution.
-        # Padding must match the decoded frames, which with vr_video are not at
-        # the clip geometry until a window is resized, so it is shaped after
-        # the first frame, and the leading context is added with it.
-        blank: Optional[torch.Tensor] = None
-        buffer: List[torch.Tensor] = []
+        # then walks windows of `window` frames at `stride`. Frames stay uint8
+        # at clip geometry until a window is complete, so memory is a few
+        # windows of 128x96 frames regardless of video length or source
+        # resolution.
+        blank = np.zeros((spec.height, spec.width, 3), dtype=np.uint8)
+        buffer: List[np.ndarray] = [blank] * context
         real_frames = 0
         # Window k starts at real frame k * stride.
         window_index = 0
 
-        # vr_permute crops AFTER decode, so cropping a frame already squashed to
-        # the clip geometry is not the same as cropping then resizing. Decode at
-        # native size and let the CPU path crop when VR is in play.
-        decode_size = None if vr_video else (spec.width, spec.height)
+        # A VR frame keeps one eye. Cropping inside ffmpeg, before the scale,
+        # selects the same source pixels as vr_permute does on a decoded
+        # frame, without ever handing Python a full-resolution frame.
         frame_source = make_video_frame_source(
             video_path,
-            decode_size=decode_size,
+            decode_size=(spec.width, spec.height),
             frame_step=1,              # every frame
             backend=self.decode_backend,
             quality=self.decode_quality,
             device_index=self.decode_device_index,
             info=info,
+            crop=vr_crop_rect(info.width, info.height) if vr_video else None,
         )
         analyze_started = time.perf_counter()
         inference_seconds = 0.0
+        decode_wait_seconds = 0.0
 
-        for _index, frame_np in frame_source:
-            frame = self._to_frame_tensor(frame_np, vr_video)
-            if blank is None:
-                blank = torch.zeros_like(frame)
-                buffer = [blank.clone() for _ in range(context)]
-            buffer.append(frame)
-            real_frames += 1
-            while len(buffer) >= window:
-                inference_seconds += self._run_window(
-                    buffer[:window], 0, window_index * stride, ranges_full, intra_full, inter_full)
-                del buffer[:stride]
-                window_index += 1
+        # Decode runs on its own thread, up to two windows ahead, so ffmpeg
+        # keeps decoding while a window is being scored. Inline, the pipe
+        # holds under two frames and ffmpeg stalls for every window.
+        with Prefetch(frame_source, maxsize=2 * window) as frames:
+            while True:
+                waited = time.perf_counter()
+                item = next(frames, None)
+                decode_wait_seconds += time.perf_counter() - waited
+                if item is None:
+                    break
+                buffer.append(item[1])
+                real_frames += 1
+                while len(buffer) >= window:
+                    inference_seconds += self._run_window(
+                        buffer[:window], 0, window_index * stride, ranges_full, intra_full, inter_full)
+                    del buffer[:stride]
+                    window_index += 1
 
         # Tail: pad what is left out to full windows until every real frame has
         # been scored. `len(buffer) > context` is exactly "real frames remain
         # unscored", since buffer holds padded[base:] and padding adds `context`
         # frames. With context frames one padded window is not always enough:
         # its trailing context can hold real frames it does not score.
-        while blank is not None and len(buffer) > context:
+        while len(buffer) > context:
             num_pad = window - len(buffer)
             clip = list(buffer)
             if num_pad > 0:
-                clip.extend(blank.clone() for _ in range(num_pad))
+                clip.extend([blank] * num_pad)
             inference_seconds += self._run_window(
                 clip[:window], max(0, num_pad), window_index * stride, ranges_full, intra_full, inter_full)
             del buffer[:stride]
             window_index += 1
 
-        # Decode and inference interleave, so time the one we can bound exactly
-        # and attribute the remainder to decoding.
         total_seconds = time.perf_counter() - analyze_started
-        decode_seconds = max(0.0, total_seconds - inference_seconds)
         self.logger.info(
-            f"Shot boundaries for {real_frames} frames: "
-            f"decode {decode_seconds:.1f}s ({real_frames / decode_seconds:.0f} fps) / "
-            f"inference {inference_seconds:.1f}s / backend {frame_source.backend_name}"
-            if decode_seconds > 0 else
+            f"Shot boundaries for {real_frames} frames in {total_seconds:.1f}s "
+            f"({real_frames / total_seconds:.0f} fps): inference {inference_seconds:.1f}s, "
+            f"waiting on decode {decode_wait_seconds:.1f}s, backend {frame_source.backend_name}"
+            if total_seconds > 0 else
             f"Shot boundaries for {real_frames} frames (backend {frame_source.backend_name})"
         )
 
@@ -372,25 +377,26 @@ class AIShotBoundaryModel(AIModel):
                 for label in intra_full
             ],
             timings={
-                "decode_seconds": round(decode_seconds, 3),
+                # Decode and inference overlap: this is the time scoring sat idle
+                # waiting for frames, not the time decoding took.
+                "decode_wait_seconds": round(decode_wait_seconds, 3),
                 "inference_seconds": round(inference_seconds, 3),
+                "analyze_seconds": round(total_seconds, 3),
             },
         )
 
-    def _to_frame_tensor(self, frame_np, vr_video: bool) -> torch.Tensor:
-        """HxWx3 uint8 -> CHW float32 in [0,255], matching apply_spec_batch's input."""
-        tensor = torch.from_numpy(frame_np.copy())
-        if vr_video:
-            tensor = vr_permute(tensor)
-        return tensor.permute(2, 0, 1).float()
-
-    def _run_window(self, frames: List[torch.Tensor], num_pad_frames: int, offset: int,
+    def _run_window(self, frames: List[np.ndarray], num_pad_frames: int, offset: int,
                     ranges_full: List[List[int]], intra_full: List[int],
                     inter_full: List[int]) -> float:
-        """Run one clip starting at real frame ``offset``, merge its predictions,
-        and return seconds spent."""
+        """Run one clip of HxWx3 uint8 frames starting at real frame ``offset``,
+        merge its predictions, and return seconds spent."""
         started = time.perf_counter()
-        clip = apply_spec_batch(torch.stack(frames), self._spec).unsqueeze(0)
+        # One uint8 stack and one float conversion per window. Converting each
+        # frame as it arrived meant thousands of tiny parallel torch ops, which
+        # kept torch's CPU thread pool spinning on every core ffmpeg needed.
+        # The values are bit-identical to that per-frame path.
+        clip = torch.from_numpy(np.stack(frames)).permute(0, 3, 1, 2).contiguous().float()
+        clip = apply_spec_batch(clip, self._spec).unsqueeze(0)
         shot_logits, intra_logits, inter_logits = self.model.run_raw_multi_output(clip, use_half=False)
 
         # [..., :-1] drops the trailing "no object" slot on every head.
@@ -424,6 +430,82 @@ class AIShotBoundaryModel(AIModel):
 
 
 # ── generic helpers (no model-specific knowledge) ────────────────────────
+
+
+class _Failure:
+    def __init__(self, exception: BaseException):
+        self.exception = exception
+
+
+_END = object()
+
+
+class Prefetch:
+    """Iterate ``iterable`` on a background thread, up to ``maxsize`` items ahead.
+
+    Items arrive in order and an exception raised by the source is re-raised
+    to the consumer. ``close()`` -- also reached by leaving a ``with`` block --
+    stops the thread and closes the source, which is what reaps an ffmpeg
+    process that is still running. It is safe before the first item and
+    after the last.
+    """
+
+    def __init__(self, iterable: Iterable, maxsize: int):
+        self._items: queue.Queue = queue.Queue(maxsize=max(1, maxsize))
+        self._stop = threading.Event()
+        self._done = False
+        self._thread = threading.Thread(
+            target=self._produce, args=(iterable,), name="shot-boundary-decode", daemon=True)
+        self._thread.start()
+
+    def _offer(self, item) -> bool:
+        while not self._stop.is_set():
+            try:
+                self._items.put(item, timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _produce(self, iterable):
+        iterator = iter(iterable)
+        try:
+            for item in iterator:
+                if not self._offer(item):
+                    return
+            self._offer(_END)
+        except BaseException as exception:  # noqa: BLE001 - handed to the consumer
+            self._offer(_Failure(exception))
+        finally:
+            close = getattr(iterator, "close", None)
+            if close is not None:
+                close()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._done:
+            raise StopIteration
+        item = self._items.get()
+        if item is _END:
+            self._done = True
+            raise StopIteration
+        if isinstance(item, _Failure):
+            self.close()
+            raise item.exception
+        return item
+
+    def close(self, timeout: float = 10.0) -> None:
+        self._done = True
+        self._stop.set()
+        self._thread.join(timeout=timeout)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.close()
 
 
 def prune_non_context_ranges(ranges, intra_labels, inter_labels, window_frames, context_frames):

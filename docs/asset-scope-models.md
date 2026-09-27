@@ -357,12 +357,23 @@ than surfacing mid-stream.
   the output pixel format rather than a separate `format` filter, so scaling and
   colour conversion happen in one swscale pass, as PyAV's `reformat` does.
 * Frames are decoded as stored (`-noautorotate`). PyAV ignores a display
-  rotation too, so every backend hands the model the same pixels.
-* Only one window of frames is held at a time, so peak memory is
-  `window_frames x 3 x H x W` regardless of video length. With `vr_video`,
-  frames are decoded at full resolution and one eye is cropped in Python, so
-  `H x W` is one eye at the source's resolution: a window of float32 crops of a
-  6144x3072 source takes about 11 GB.
+  rotation too, so every backend hands the model the same pixels, and a VR
+  crop is taken from the frame it was computed for.
+* Frames stay uint8 at the clip geometry until a window is complete, and at
+  most two windows are decoded ahead, so memory is a few windows of
+  `H x W x 3` bytes regardless of video length or source resolution. Each
+  window is stacked, converted to float and normalised once; converting every
+  frame as it arrived kept torch's CPU thread pool spinning on the cores
+  ffmpeg needed. The values are bit-identical either way.
+* Decode runs on its own thread, up to two windows ahead of inference. Inline,
+  the pipe holds under two 128x96 frames, so ffmpeg stalled for every window
+  that was being scored. The result reports `inference_seconds` and
+  `decode_wait_seconds` — the time scoring sat idle waiting for frames — which
+  overlap and do not add up to `analyze_seconds`.
+* With `vr_video`, one eye is cropped inside ffmpeg, before the scale, using
+  the same region `vr_permute` keeps. Cropping a decoded frame in Python would
+  instead pipe full-resolution frames and hold a window of them in memory.
+  A cropped source is always decoded in software.
 * Decode and inference run in an executor. They take minutes, and running them
   inline would block the event loop and stall every other model — including the
   tagging pass over the same video.

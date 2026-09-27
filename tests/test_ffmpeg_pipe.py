@@ -118,7 +118,7 @@ def test_raw_output_is_rgb24_on_stdout():
 @pytest.mark.parametrize("hw", [True, False])
 def test_command_decodes_frames_as_stored(hw):
     """PyAV ignores a display rotation; so must ffmpeg, or the two backends
-    hand the model different frames."""
+    hand the model different frames and a VR crop lands on a rotated frame."""
     command = fp.build_command("ffmpeg", "in.mp4", _chain(hw=hw), hw, True)
     assert command[command.index("-i") - 1] == "-noautorotate"
 
@@ -329,3 +329,72 @@ def test_abandoning_the_iterator_reaps_ffmpeg(clip):
     for _ in zip(range(3), iterator):
         pass
     iterator.close()  # must not leave a zombie or block
+
+
+# ── VR crop ──────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("width,height", [
+    (5760, 2880), (5244, 2622), (7680, 3840), (1921, 960),   # 180-degree side by side
+    (4096, 4096), (2880, 2880), (3841, 3840), (1080, 1080),  # 360-degree
+])
+def test_vr_crop_rect_selects_exactly_what_vr_permute_keeps(width, height):
+    """Cropping in ffmpeg must pick the same source pixels as the Python crop
+    it replaces, including for odd dimensions."""
+    import torch
+    from lib.model.preprocessing_python.image_preprocessing import vr_permute
+
+    rows = np.arange(height, dtype=np.int64)[:, None] * 100_000
+    frame = torch.from_numpy(np.broadcast_to(rows + np.arange(width)[None, :], (height, width)).copy())
+    kept = vr_permute(frame)
+    x, y, crop_width, crop_height = fp.vr_crop_rect(width, height)
+    assert (crop_height, crop_width) == tuple(kept.shape)
+    assert int(kept[0, 0]) == y * 100_000 + x
+
+
+def test_crop_happens_before_scaling_and_is_exact():
+    plan = fp.plan_scale(5760, 2880, (128, 96), crop=fp.vr_crop_rect(5760, 2880))
+    chain = fp.build_filter_chain(plan, 1, False)
+    assert chain.startswith("crop=2880:2880:2880:0:exact=1,")
+    assert chain.index("crop=") < chain.index("scale=")
+
+
+def test_scale_plan_is_made_from_the_cropped_size():
+    plan = fp.plan_scale(5760, 2880, (2880, 2880), crop=(2880, 0, 2880, 2880))
+    assert plan.is_noop and plan.crop == (2880, 0, 2880, 2880)
+    assert fp.build_filter_chain(plan, 1, False) == "crop=2880:2880:2880:0:exact=1"
+
+
+def test_a_cropped_source_is_never_given_to_nvdec():
+    plan = fp.plan_scale(5760, 2880, (128, 96), crop=fp.vr_crop_rect(5760, 2880))
+    with pytest.raises(ValueError):
+        fp.build_filter_chain(plan, 1, True)
+    assert fp._ladder("ffmpeg_cuda")[1:] == ["ffmpeg_cpu", "av"]  # so it falls through
+
+
+@needs_ffmpeg
+def test_ffmpeg_crop_matches_cropping_a_decoded_frame(clip):
+    """No scaling: the only difference allowed is chroma interpolation at the
+    crop edge, since ffmpeg crops before converting 4:2:0 to RGB."""
+    import torch
+    from lib.model.preprocessing_python.image_preprocessing import vr_permute
+
+    full = fp.make_video_frame_source(clip, decode_size=None, backend="ffmpeg_cpu")
+    reference = np.stack([vr_permute(torch.from_numpy(frame.copy())).numpy() for _i, frame in full])
+    rect = fp.vr_crop_rect(640, 360)
+    cropped = fp.make_video_frame_source(clip, decode_size=(rect[2], rect[3]), backend="ffmpeg_cpu", crop=rect)
+    assert (cropped.width, cropped.height) == (rect[2], rect[3])
+    frames = np.stack([frame for _i, frame in cropped])
+    assert frames.shape == reference.shape
+    delta = np.abs(frames.astype(np.int16) - reference.astype(np.int16))
+    assert delta[:, :, 2:].max() <= 2, "pixels away from the crop edge must match"
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("backend", ["ffmpeg_cpu", "av"])
+def test_cropped_decode_scales_to_the_target_on_every_backend(clip, backend):
+    source = fp.make_video_frame_source(
+        clip, decode_size=(128, 96), backend=backend, crop=fp.vr_crop_rect(640, 360))
+    assert source.backend_name == backend
+    frames = [frame for _i, frame in source]
+    assert len(frames) == 60 and frames[0].shape == (96, 128, 3)
+
