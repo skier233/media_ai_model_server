@@ -398,3 +398,59 @@ def test_cropped_decode_scales_to_the_target_on_every_backend(clip, backend):
     frames = [frame for _i, frame in source]
     assert len(frames) == 60 and frames[0].shape == (96, 128, 3)
 
+
+# ── probing ──────────────────────────────────────────────────────────────
+
+def test_probe_reports_the_codec_not_the_decoder(monkeypatch):
+    """PyAV opens AV1 with libdav1d; NVDEC eligibility is decided by codec."""
+    import av
+    import types
+
+    ctx = types.SimpleNamespace(
+        name="libdav1d", codec=types.SimpleNamespace(name="libdav1d", canonical_name="av1"),
+        width=3840, height=2160, pix_fmt="yuv420p10le", field_order=None,
+    )
+    stream = types.SimpleNamespace(
+        codec_context=ctx, average_rate=30, guessed_rate=None, duration=None, time_base=None,
+        frames=300, color_range=None, colorspace=None,
+    )
+
+    class Container:
+        streams = types.SimpleNamespace(video=[stream])
+        duration = 10 * av.time_base
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+    monkeypatch.setattr(av, "open", lambda _path: Container())
+    info = fp.probe_video("/tmp/does-not-matter.mkv")
+    assert info.codec == "av1"
+    assert fp.nvdec_supports(info)[0] is True
+
+
+def test_probe_falls_back_to_the_context_name(monkeypatch):
+    import av
+    import types
+
+    ctx = types.SimpleNamespace(name="h264", codec=None, width=1920, height=1080,
+                                pix_fmt="yuv420p", field_order=None)
+    stream = types.SimpleNamespace(
+        codec_context=ctx, average_rate=25, guessed_rate=None, duration=None, time_base=None,
+        frames=100, color_range=None, colorspace=None,
+    )
+
+    class Container:
+        streams = types.SimpleNamespace(video=[stream])
+        duration = 4 * av.time_base
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+    monkeypatch.setattr(av, "open", lambda _path: Container())
+    assert fp.probe_video("/tmp/x.mp4").codec == "h264"

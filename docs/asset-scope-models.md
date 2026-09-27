@@ -336,6 +336,10 @@ GPU halvings followed by one small swscale step, so no single step exceeds 2x an
 the final kernel matches the software path. That pyramid is free — it measured
 274.5 fps against 275.8 fps for a single `scale_cuda`.
 
+NVDEC eligibility is decided by the source's codec. PyAV opens AV1 with its
+`libdav1d` decoder, so the probe reports the codec's canonical name (`av1`)
+rather than the decoder's; reporting the decoder kept AV1 off NVDEC entirely.
+
 Frame count must match a software decode exactly, because consumers map frame
 index to time as `index / fps`. The pipeline therefore uses `-fps_mode
 passthrough` and a `select` frame modulo, never the `fps` filter, which

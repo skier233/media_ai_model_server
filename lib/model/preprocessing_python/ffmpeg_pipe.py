@@ -204,7 +204,9 @@ def probe_video(video_path) -> VideoInfo:
             width=int(ctx.width or 0),
             height=int(ctx.height or 0),
             pix_fmt=str(getattr(ctx, "pix_fmt", "") or ""),
-            codec=str(ctx.name or ""),
+            # The codec, not the decoder PyAV picked for it: AV1 opens with
+            # libdav1d, and NVDEC eligibility is decided by codec.
+            codec=_codec_name(ctx),
             fps=fps,
             duration=duration,
             nb_frames=int(stream.frames or 0),
@@ -213,6 +215,12 @@ def probe_video(video_path) -> VideoInfo:
             color_matrix=_enum_name(getattr(stream, "colorspace", None), _COLOR_SPACE_NAMES),
             fps_assumed=fps_assumed,
         )
+
+
+def _codec_name(ctx) -> str:
+    codec = getattr(ctx, "codec", None)
+    canonical = getattr(codec, "canonical_name", None) if codec is not None else None
+    return str(canonical or getattr(ctx, "name", None) or "")
 
 
 # PyAV exposes these as raw ffmpeg enum integers (and, in other versions, as
