@@ -463,6 +463,25 @@ def probe_keyframe_interval_seconds(
     return None
 
 
+def probe_video_dimensions(video_path) -> Optional[tuple]:
+    """Return the video stream's coded ``(width, height)``, or ``None``.
+
+    These are the dimensions of the frames the decode backends yield (a
+    display rotation is not applied by any of them).
+    """
+    try:
+        import av
+
+        with av.open(str(_validate_local_video_source(video_path))) as container:
+            stream = container.streams.video[0]
+            width, height = int(stream.width or 0), int(stream.height or 0)
+        if width > 0 and height > 0:
+            return width, height
+    except Exception as exc:
+        _LOGGER.debug("Dimension probe failed for '%s': %s", video_path, exc)
+    return None
+
+
 def _format_ffmpeg_float(value: float) -> str:
     text = f"{value:.12f}"
     text = text.rstrip("0").rstrip(".")
@@ -1179,6 +1198,10 @@ def preprocess_video_mp_pyav(
     norm_config=1,
     max_decode_long_edge=0,
     decode_workers=None,
+    skip_nonref=False,
+    dense_sinks=None,
+    dense_crop=None,
+    emit_interval=True,
     **_kwargs,
 ):
     """TRUE per-interval sampling via parallel PyAV decode in worker *processes*.
@@ -1192,6 +1215,16 @@ def preprocess_video_mp_pyav(
 
     Frames are produced out of timestamp order; each carries its target time and
     the video preprocessor sorts children by frame_index before assembly.
+
+    ``skip_nonref`` lets the decoder drop frames nothing else references, which
+    is roughly twice as fast on sources with B-frames; a sample can then land
+    on the next decodable frame instead of its own.
+
+    ``dense_sinks`` is ``[((width, height), [DenseFrameStream, ...]), ...]``:
+    every frame of the video is also resized to each size and handed to its
+    streams, for models that need every frame. ``dense_crop`` is applied to
+    those frames before the resize. ``emit_interval`` False decodes for the
+    dense sinks only and yields no frames.
     """
     from lib.model.preprocessing_python.mp_decode import iter_parallel_frames
 
@@ -1212,10 +1245,37 @@ def preprocess_video_mp_pyav(
     )
     _mdle = int(max_decode_long_edge) if max_decode_long_edge else 0
 
+    dense_sinks = list(dense_sinks or [])
+    streams = [stream for _size, sink_streams in dense_sinks for stream in sink_streams]
+    segment_counts = {}
+
+    def _on_dense(segment, size_index, frames):
+        for stream in dense_sinks[size_index][1]:
+            stream.put(segment, frames)
+
+    def _on_segment(segment, count):
+        segment_counts[segment] = count
+
     # The decode (av) runs in child processes; the torch transform stays in this
     # parent process where the rest of the pipeline lives.
-    for out_idx, frame_np in iter_parallel_frames(
-        video_path, frame_interval, _mdle, int(decode_workers), use_timestamps,
-    ):
-        result = _prepare_frame(frame_np, device, vr_video, frame_transforms)
-        yield (out_idx, result)
+    try:
+        for out_idx, frame_np in iter_parallel_frames(
+            video_path, frame_interval, _mdle, int(decode_workers), use_timestamps,
+            skip_nonref=bool(skip_nonref) and not dense_sinks,
+            dense_sizes=[size for size, _streams in dense_sinks] or None,
+            dense_crop=dense_crop,
+            on_dense=_on_dense if dense_sinks else None,
+            on_segment=_on_segment if dense_sinks else None,
+            emit_interval=emit_interval,
+        ):
+            result = _prepare_frame(frame_np, device, vr_video, frame_transforms)
+            yield (out_idx, result)
+    except BaseException as exc:
+        # Includes the consumer closing this generator early: a stream that is
+        # neither finished nor failed would leave its reader waiting forever.
+        for stream in streams:
+            stream.fail(exc if isinstance(exc, Exception) else RuntimeError("the decode was stopped early"))
+        raise
+    counts = [segment_counts[segment] for segment in sorted(segment_counts)]
+    for stream in streams:
+        stream.finish(counts)

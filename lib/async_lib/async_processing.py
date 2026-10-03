@@ -134,35 +134,19 @@ class ModelProcessor():
             item.input_names,
             ["dynamic_skipped_categories", "skipped_categories"],
         )
-        if skipped_categories is not None:
-            this_ai_categories = self.model.model_category or []
-            if this_ai_categories and all(this_category in skipped_categories for this_category in this_ai_categories):
-                return "category_skipped"
-
         requested_model_names = _resolve_optional_future_value(
             item.item_future,
             item.input_names,
             ["dynamic_requested_model_names", "requested_model_names"],
         )
-        if requested_model_names:
-            normalized_requested = {str(name).strip() for name in requested_model_names if str(name).strip()}
-            candidate_names = {
-                str(getattr(self.model, "config_name", "") or "").strip(),
-                str(getattr(self.model, "model_file_name", "") or "").strip(),
-            }
-            candidate_names.discard("")
-            if candidate_names and candidate_names.isdisjoint(normalized_requested):
-                return "not_requested"
-        elif is_whole_asset_model(self.model) and _has_future_value_slot(
-            item.item_future, item.input_names, ["dynamic_requested_model_names", "requested_model_names"]
-        ):
-            # A request that names no models (the legacy endpoints, or /v4
-            # without `want`) means "the usual per-frame analysis". A
-            # whole-asset model decodes every frame of the video itself, so it
-            # runs only when a request asks for it by name. A stage that is not
-            # given the requested names at all is not gated.
-            return "not_named"
-        return None
+        return model_skip_reason(
+            self.model,
+            skipped_categories,
+            requested_model_names,
+            names_slot_present=_has_future_value_slot(
+                item.item_future, item.input_names, ["dynamic_requested_model_names", "requested_model_names"]
+            ),
+        )
 
     async def _complete_if_skipped(self, item):
         reason = self._skip_reason(item)
@@ -285,6 +269,37 @@ class ModelProcessor():
                 metrics = {}
                 setattr(root_future, "_pipeline_metrics", metrics)
             metrics["ai_inference_seconds"] = metrics.get("ai_inference_seconds", 0.0) + (elapsed * (count / total_items))
+
+
+def model_skip_reason(model, skipped_categories, requested_model_names, names_slot_present=True):
+    """Why ``model`` should not run for a request, or None if it should.
+
+    Shared by the per-model skip gate and by the video preprocessor, which has
+    to make the same decision earlier: whether a model that needs every frame
+    will run decides how the video is decoded.
+    """
+    if skipped_categories is not None:
+        this_ai_categories = model.model_category or []
+        if this_ai_categories and all(this_category in skipped_categories for this_category in this_ai_categories):
+            return "category_skipped"
+
+    if requested_model_names:
+        normalized_requested = {str(name).strip() for name in requested_model_names if str(name).strip()}
+        candidate_names = {
+            str(getattr(model, "config_name", "") or "").strip(),
+            str(getattr(model, "model_file_name", "") or "").strip(),
+        }
+        candidate_names.discard("")
+        if candidate_names and candidate_names.isdisjoint(normalized_requested):
+            return "not_requested"
+    elif is_whole_asset_model(model) and names_slot_present:
+        # A request that names no models (the legacy endpoints, or /v4
+        # without `want`) means "the usual per-frame analysis". A
+        # whole-asset model needs every frame of the video decoded, so it
+        # runs only when a request asks for it by name. A stage that is not
+        # given the requested names at all is not gated.
+        return "not_named"
+    return None
 
 
 def _has_future_value_slot(item_future, input_names, preferred_keys):

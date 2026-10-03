@@ -938,6 +938,11 @@ async def region_children_builder(data):
         label_filter = _extract_region_label_filter(item.output_names)
 
         children = []
+        if not region_targets:
+            # Nothing was detected, or the detector did not run for this
+            # request, in which case its region source was never produced.
+            await itemFuture.set_data(item.output_names[0], children)
+            continue
         if not isinstance(source_tensor, torch.Tensor):
             raise ValueError("region_children_builder requires source_tensor input as a torch.Tensor")
 

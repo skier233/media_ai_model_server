@@ -1,10 +1,12 @@
 """Asset-scope temporal segmentation (shot-boundary detection).
 
-Unlike every other AI model in this server, a shot-boundary model does not
-consume preprocessed frames handed to it by the shared frame preprocessor: it
-needs dense, *adjacent* frames across the whole asset, at its own resolution.
-It therefore runs at ``asset`` scope, receives the video path directly, and
-drives its own decode.
+Unlike every other AI model in this server, a shot-boundary model cannot work
+from frames sampled at the request's interval: it needs dense, *adjacent*
+frames across the whole asset, at its own resolution. It therefore runs at
+``asset`` scope and sets ``requires_every_frame``. It does not decode the
+video itself: the shared video preprocessor decodes every frame once for the
+request and hands them over as a ``DenseFrameStream`` (see
+lib/model/dense_frames.py).
 
 The artifact contract (see docs/asset-scope-models.md) is a self-contained ``.pt2``/``.pt`` module::
 
@@ -37,12 +39,12 @@ import numpy as np
 import torch
 
 from lib.model.ai_model import AIModel
-from lib.model.preprocessing_python.ffmpeg_pipe import (
-    make_video_frame_source,
-    probe_video,
-    vr_crop_rect,
+from lib.model.dense_frames import DenseFrameStream, DenseStreamError, dense_stream_for
+from lib.model.preprocessing_python.ffmpeg_pipe import probe_video, vr_crop_rect
+from lib.model.preprocessing_python.image_preprocessing import (
+    _validate_local_video_source,
+    preprocess_video_mp_pyav,
 )
-from lib.model.preprocessing_python.image_preprocessing import _validate_local_video_source
 from lib.pipeline.preprocess_spec import PreprocessSpec, apply_spec_batch
 
 # NORMALIZATION_PRESETS key of the ImageNet mean/std the artifacts are trained with.
@@ -56,6 +58,10 @@ class AIShotBoundaryModel(AIModel):
     # in the asset-scope stage and only when a request names it. See
     # lib/model/whole_asset.py.
     whole_asset_model = True
+
+    # Tells the shared video preprocessor to decode every frame of the video
+    # when this model runs, and to deliver them at ``dense_frame_size()``.
+    requires_every_frame = True
 
     MODES = ("default", "clean_shot")
 
@@ -93,6 +99,12 @@ class AIShotBoundaryModel(AIModel):
     def _name(self) -> str:
         """Display name: the config yaml's stem once the manager attaches it, else the artifact."""
         return getattr(self, "config_name", None) or self.model_file_name
+
+    def dense_frame_size(self) -> tuple:
+        """``(width, height)`` every frame is resized to for this model."""
+        if self._spec is None:
+            self._load_labels()
+        return self._spec.width, self._spec.height
 
     # ── lifecycle ────────────────────────────────────────────────────────
 
@@ -237,10 +249,18 @@ class AIShotBoundaryModel(AIModel):
                     raw_vr = item.item_future[item.input_names[1]]
                     vr_video = bool(raw_vr) if raw_vr is not None else False
 
-                # Decode + inference take minutes, not milliseconds. Running them
-                # inline would block the event loop and stall every other model —
-                # including the tagging pass over this same video.
-                result = await loop.run_in_executor(None, self._analyze, video_path, vr_video)
+                stream = self._shared_stream(root)
+                try:
+                    # Inference takes minutes, not milliseconds. Running it
+                    # inline would block the event loop and stall every other
+                    # model — including the tagging pass over this same video.
+                    arguments = (video_path, vr_video) if stream is None else (video_path, vr_video, stream)
+                    result = await loop.run_in_executor(None, self._analyze, *arguments)
+                finally:
+                    if stream is not None:
+                        # Whatever happened, the shared decode must not keep
+                        # waiting for this model to read.
+                        stream.abandon()
                 await item.item_future.set_data(item.output_names[0], result)
             except Exception as exception:  # noqa: BLE001 - reported per item
                 # The item's future is the request's own. Failing it would throw
@@ -249,9 +269,28 @@ class AIShotBoundaryModel(AIModel):
                 self.logger.error(f"{self._name}: shot-boundary analysis failed: {exception}", exc_info=True)
                 await item.item_future.set_data(item.output_names[0], exception)
 
+    def _shared_stream(self, root):
+        """This request's every-frame stream from the shared video preprocessor,
+        or None when the request did not come through a pipeline (the model is
+        then being driven directly, and ``_analyze`` decodes for itself through
+        the same shared decode)."""
+        pipeline = root["pipeline"] if hasattr(root, "__getitem__") else None
+        if pipeline is None:
+            return None
+        preprocessor = pipeline.get_first_video_preprocessor()
+        if preprocessor is None or self not in getattr(preprocessor, "dense_consumers", []):
+            raise RuntimeError(
+                f"{self._name} needs every frame, but this pipeline has no shared video "
+                f"preprocessor to supply them (it needs a dynamic_video_ai stage)"
+            )
+        width, height = self.dense_frame_size()
+        stream = dense_stream_for(root, self._name, width, height)
+        stream.attach()
+        return stream
+
     # ── inference ────────────────────────────────────────────────────────
 
-    def _analyze(self, video_path, vr_video: bool) -> dict:
+    def _analyze(self, video_path, vr_video: bool, stream=None) -> dict:
         window = self.window_frames
         context = self.context_frames
         stride = window - 2 * context
@@ -266,71 +305,106 @@ class AIShotBoundaryModel(AIModel):
         duration = float(info.duration or 0.0)
         fps = float(info.fps or 30.0)
 
-        ranges_full: List[List[int]] = []
-        intra_full: List[int] = []
-        inter_full: List[int] = []
-
-        # Rolling window over the padded frame stream. OmniShotCut's reference
-        # implementation prepends `context` black frames to the whole video,
-        # then walks windows of `window` frames at `stride`. Frames stay uint8
-        # at clip geometry until a window is complete, so memory is a few
-        # windows of 128x96 frames regardless of video length or source
-        # resolution.
-        blank = np.zeros((spec.height, spec.width, 3), dtype=np.uint8)
-        buffer: List[np.ndarray] = [blank] * context
-        real_frames = 0
-        # Window k starts at real frame k * stride.
-        window_index = 0
-
-        # A VR frame keeps one eye. Cropping inside ffmpeg, before the scale,
-        # selects the same source pixels as vr_permute does on a decoded
-        # frame, without ever handing Python a full-resolution frame.
-        frame_source = make_video_frame_source(
+        # A VR frame keeps one eye. The crop is taken before the scale and
+        # selects the same source pixels as vr_permute does on a decoded frame.
+        frame_source = stream if stream is not None else make_video_frame_source(
             video_path,
             decode_size=(spec.width, spec.height),
-            frame_step=1,              # every frame
-            backend=self.decode_backend,
-            quality=self.decode_quality,
-            device_index=self.decode_device_index,
-            info=info,
             crop=vr_crop_rect(info.width, info.height) if vr_video else None,
         )
         analyze_started = time.perf_counter()
         inference_seconds = 0.0
         decode_wait_seconds = 0.0
 
-        # Decode runs on its own thread, up to two windows ahead, so ffmpeg
-        # keeps decoding while a window is being scored. Inline, the pipe
-        # holds under two frames and ffmpeg stalls for every window.
-        with Prefetch(frame_source, maxsize=2 * window) as frames:
-            while True:
-                waited = time.perf_counter()
-                item = next(frames, None)
-                decode_wait_seconds += time.perf_counter() - waited
-                if item is None:
-                    break
-                buffer.append(item[1])
-                real_frames += 1
-                while len(buffer) >= window:
-                    inference_seconds += self._run_window(
-                        buffer[:window], 0, window_index * stride, ranges_full, intra_full, inter_full)
-                    del buffer[:stride]
-                    window_index += 1
+        # The shared decode runs over contiguous segments of the video in
+        # parallel, so frames arrive in order within a segment while segments
+        # interleave. Each segment is windowed on its own, exactly as a whole
+        # video is: OmniShotCut's reference implementation prepends `context`
+        # black frames, then walks windows of `window` frames at `stride`, and
+        # the last window is padded. Frames stay uint8 at clip geometry until
+        # a window is complete, so memory is under one window per segment
+        # regardless of video length or source resolution.
+        blank = np.zeros((spec.height, spec.width, 3), dtype=np.uint8)
+        segments: Dict[int, "_Segment"] = {}
 
-        # Tail: pad what is left out to full windows until every real frame has
-        # been scored. `len(buffer) > context` is exactly "real frames remain
-        # unscored", since buffer holds padded[base:] and padding adds `context`
-        # frames. With context frames one padded window is not always enough:
-        # its trailing context can hold real frames it does not score.
-        while len(buffer) > context:
-            num_pad = window - len(buffer)
-            clip = list(buffer)
-            if num_pad > 0:
-                clip.extend([blank] * num_pad)
+        def score(segment: "_Segment", clip, num_pad):
+            nonlocal inference_seconds
+            ranges, intra, inter = [], [], []
             inference_seconds += self._run_window(
-                clip[:window], max(0, num_pad), window_index * stride, ranges_full, intra_full, inter_full)
-            del buffer[:stride]
-            window_index += 1
+                clip, num_pad, segment.window_index * stride, ranges, intra, inter)
+            if num_pad > 0:
+                # A padded window can place a shot's end inside its padding.
+                # At the end of the video the partition trims that; inside it,
+                # those frames belong to the next segment.
+                kept = [index for index, frame_range in enumerate(ranges) if frame_range[0] < segment.frames]
+                ranges = [[ranges[index][0], min(ranges[index][1], segment.frames)] for index in kept]
+                intra = [intra[index] for index in kept]
+                inter = [inter[index] for index in kept]
+            segment.windows.append((ranges, intra, inter))
+            del segment.buffer[:stride]
+            segment.window_index += 1
+
+        frames_iterator = iter(frame_source)
+        while True:
+            waited = time.perf_counter()
+            item = next(frames_iterator, None)
+            decode_wait_seconds += time.perf_counter() - waited
+            if item is None:
+                break
+            segment = segments.get(item[0])
+            if segment is None:
+                segment = segments[item[0]] = _Segment([blank] * context)
+            for frame in item[1]:
+                segment.buffer.append(frame)
+                segment.frames += 1
+                while len(segment.buffer) >= window:
+                    score(segment, segment.buffer[:window], 0)
+
+        # Tail of each segment: pad what is left out to full windows until
+        # every real frame has been scored. `len(buffer) > context` is exactly
+        # "real frames remain unscored", since buffer holds padded[base:] and
+        # padding adds `context` frames. With context frames one padded window
+        # is not always enough: its trailing context can hold real frames it
+        # does not score.
+        for index in sorted(segments):
+            segment = segments[index]
+            while len(segment.buffer) > context:
+                num_pad = window - len(segment.buffer)
+                clip = list(segment.buffer)
+                if num_pad > 0:
+                    clip.extend([blank] * num_pad)
+                score(segment, clip[:window], max(0, num_pad))
+
+        real_frames = sum(segment.frames for segment in segments.values())
+        if real_frames == 0:
+            # An empty result would look like a video with no shots rather
+            # than a failed decode.
+            raise DenseStreamError(f"the {frame_source.backend_name} decode produced no frames")
+        counts = getattr(frame_source, "segment_counts", None)
+        if counts is not None:
+            received = [segments[index].frames if index in segments else 0 for index in range(len(counts))]
+            if received != list(counts):
+                # Like a short read: a truncated decode yields results that
+                # look entirely plausible and are wrong.
+                raise DenseStreamError(
+                    f"expected {list(counts)} frames per segment from the decode, received {received}"
+                )
+
+        # Global frame numbers follow from the segments' frame counts, so the
+        # windows are merged only now, in video order. A segment seam is a
+        # window seam like any other: a shot that continues across it is joined.
+        ranges_full: List[List[int]] = []
+        intra_full: List[int] = []
+        inter_full: List[int] = []
+        segment_offset = 0
+        for index in sorted(segments):
+            segment = segments[index]
+            for ranges, intra, inter in segment.windows:
+                merge_ranges(
+                    ranges_full, intra_full, inter_full, ranges, intra, inter, segment_offset,
+                    new_start_inter_index=self._new_start_inter_index,
+                )
+            segment_offset += segment.frames
 
         total_seconds = time.perf_counter() - analyze_started
         self.logger.info(
@@ -430,6 +504,43 @@ class AIShotBoundaryModel(AIModel):
 
 
 # ── generic helpers (no model-specific knowledge) ────────────────────────
+
+
+class _Segment:
+    """Windowing state for one contiguous run of frames."""
+
+    def __init__(self, buffer):
+        self.buffer: List[np.ndarray] = list(buffer)
+        self.frames = 0
+        # Window k of the segment starts at its frame k * stride.
+        self.window_index = 0
+        # One (ranges, intra, inter) per scored window, in segment frame numbers.
+        self.windows: List[tuple] = []
+
+
+def make_video_frame_source(video_path, *, decode_size, crop=None, decode_workers=None, **_ignored):
+    """Every frame of ``video_path`` at ``decode_size``, without a pipeline.
+
+    Runs the shared preprocessor's decode on a background thread and returns
+    its ``DenseFrameStream``. A request never comes this way: there the
+    preprocessor is already decoding the video and supplies the stream.
+    """
+    stream = DenseFrameStream(decode_size[0], decode_size[1])
+    stream.attach()
+
+    def produce():
+        try:
+            for _frame in preprocess_video_mp_pyav(
+                video_path, 1.0, 0, False, "cpu", False, norm_config=-1,
+                decode_workers=decode_workers, dense_sinks=[(tuple(decode_size), [stream])],
+                dense_crop=crop, emit_interval=False,
+            ):
+                pass
+        except BaseException:  # noqa: BLE001 - already handed to the stream
+            pass
+
+    threading.Thread(target=produce, name="shot-boundary-decode", daemon=True).start()
+    return stream
 
 
 class _Failure:

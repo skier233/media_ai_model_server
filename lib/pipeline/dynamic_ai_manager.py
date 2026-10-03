@@ -147,7 +147,7 @@ class DynamicAIManager:
         if normalized_mode == "audio":
             return self._create_dynamic_audio_wrappers(inputs, outputs, selected_models, pipeline_name=pipeline_name)
         if normalized_mode == "asset":
-            return self._create_dynamic_asset_wrappers(inputs, outputs, selected_models)
+            return self._create_dynamic_asset_wrappers(inputs, outputs, selected_models, pipeline_name=pipeline_name)
 
         raise ValueError(f"Error: Unsupported dynamic mode '{mode}'. Expected 'image', 'video', 'region', 'audio', or 'asset'.")
 
@@ -213,6 +213,21 @@ class DynamicAIManager:
         video_preprocessor.model.downstream_model_names = _downstream_model_names(
             [m for m in self.models if not is_whole_asset_model(m)]
         )
+        # Which models read which spec, so a request that names its models is
+        # only given the specs those models read. The detector's input and the
+        # region source belong to the detector and to every model run on its
+        # regions.
+        spec_consumers = {}
+        for model in models:
+            spec_consumers.setdefault(model_to_spec[id(model)].key, set()).update(_downstream_model_names([model]))
+        if region_source_spec is not None:
+            region_models = self._select_models_by_name(_dedupe_strings([
+                name for rule in region_model_rules for name in (rule.get("models", []) or [])
+            ]))
+            region_names = _downstream_model_names(detector_models, region_models)
+            for spec in [region_source_spec] + list(detector_to_spec.values()):
+                spec_consumers.setdefault(spec.key, set()).update(region_names)
+        video_preprocessor.model.spec_consumers = spec_consumers
 
         # Build output names: fixed outputs + one per spec.
         fixed_outputs = [
@@ -454,7 +469,7 @@ class DynamicAIManager:
         self.logger.debug("Finished creating dynamic Audio AI models")
         return model_wrappers
 
-    def _create_dynamic_asset_wrappers(self, inputs, outputs, models):
+    def _create_dynamic_asset_wrappers(self, inputs, outputs, models, pipeline_name=None):
         """Wire asset-scope models directly onto the parent future.
 
         Asset-scope models consume the asset itself (a video path) rather than
@@ -470,6 +485,17 @@ class DynamicAIManager:
         model_wrappers = []
         for model in models:
             model_wrappers.append(ModelWrapper(model, list(inputs), model.model.model_category))
+
+        # A model that needs every frame gets them from the pipeline's shared
+        # video preprocessor, which has to know to decode in full for it.
+        if pipeline_name:
+            video_preprocessor = self.model_manager.get_or_create_model_alias(
+                "video_preprocessor_dynamic", f"video_preprocessor_dynamic__{pipeline_name}")
+        else:
+            video_preprocessor = self.model_manager.get_or_create_model("video_preprocessor_dynamic")
+        video_preprocessor.model.dense_consumers = [
+            m.model for m in models if getattr(m.model, "requires_every_frame", False)
+        ]
 
         collector_inputs = [inputs[0]] + _dedupe_strings(self._build_coalesce_inputs(models))
         model_wrappers.append(ModelWrapper(
