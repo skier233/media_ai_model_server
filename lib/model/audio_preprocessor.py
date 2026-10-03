@@ -6,7 +6,7 @@ Each child carries preprocessed tensors (filterbank for the embedding model,
 mel-spectrogram for the classifier) and flows through the per-window AI model DAG independently.
 
 Pipeline:
-  1. ffmpeg        → extract WAV (16 kHz mono)
+  1. PyAV          → decode audio in-process (16 kHz mono)
   2. Demucs        → vocal / accompaniment separation (optional, resamples to 44.1 kHz internally)
   3. Energy VAD    → detect vocal regions in the vocal stem
   4. Windowing     → 4 s windows, 2 s hop, energy-floor filtering
@@ -21,14 +21,11 @@ and per-type centroid embedding computation.
 import asyncio
 import logging
 import os
-import subprocess
-import tempfile
 import time
 
 import numpy as np
 import torch
 import torchaudio
-import soundfile as sf
 
 from lib.async_lib.async_processing import ItemFuture
 from lib.model.model import Model
@@ -300,28 +297,69 @@ class AudioPreprocessorModel(Model):
 # ── Thread-pool helpers (no asyncio primitives) ──────────────────────
 
 def _extract_wav(input_path: str, sample_rate: int = 16000) -> torch.Tensor:
-    """Extract audio from any media file via ffmpeg → mono float32 tensor [1, T]."""
-    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".wav")
-    os.close(tmp_fd)
-    try:
-        cmd = [
-            "ffmpeg", "-y", "-i", input_path,
-            "-vn", "-ac", "1", "-ar", str(sample_rate),
-            "-acodec", "pcm_s16le", tmp_path,
-        ]
-        result = subprocess.run(cmd, capture_output=True, timeout=300)
-        if result.returncode != 0:
-            stderr = result.stderr.decode("utf-8", errors="replace")
-            raise RuntimeError(f"ffmpeg failed (rc={result.returncode}): {stderr[:500]}")
+    """Extract audio from any media file → mono float32 tensor [1, T] at ``sample_rate``.
 
-        waveform_np, sr = sf.read(tmp_path, dtype="float32")
-        waveform = torch.from_numpy(waveform_np).unsqueeze(0)  # [1, T]
-        if waveform.dim() == 3:
-            waveform = waveform.mean(dim=-1)
-        return waveform
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+    Decodes in-process with PyAV, which links its own libav* libraries, so no
+    ``ffmpeg`` executable needs to be on PATH and no temporary WAV is written.
+
+    ``rematrix_maxval=1.0`` reproduces what the previous ``ffmpeg -ac 1 -acodec
+    pcm_s16le`` call did implicitly: the CLI sets that swresample option when the
+    output format is integer, which normalises the downmix matrix (stereo becomes
+    0.5*L + 0.5*R rather than the energy-preserving 0.707 coefficients). Without
+    it the waveform comes out ~3 dB hotter, which would shift the VAD energy
+    floor and every downstream spectrogram. Letting libswresample do the downmix
+    also keeps the layout-aware weighting for multichannel sources, where the
+    centre channel carries most of the dialogue.
+    """
+    import av
+    from av.filter import Graph
+
+    chunks: list[np.ndarray] = []
+
+    with av.open(input_path) as container:
+        if not container.streams.audio:
+            raise RuntimeError(f"No audio stream found in {input_path}")
+
+        stream = container.streams.audio[0]
+        stream.thread_type = "AUTO"
+
+        graph = Graph()
+        source = graph.add_abuffer(template=stream)
+        resample = graph.add(
+            "aresample",
+            f"rematrix_maxval=1.0:out_sample_rate={sample_rate}:out_chlayout=mono",
+        )
+        fmt = graph.add(
+            "aformat",
+            f"sample_fmts=fltp:sample_rates={sample_rate}:channel_layouts=mono",
+        )
+        sink = graph.add("abuffersink")
+        source.link_to(resample)
+        resample.link_to(fmt)
+        fmt.link_to(sink)
+        graph.configure()
+
+        def _drain() -> None:
+            # PyAV raises BlockingIOError when the graph needs more input and
+            # EOFError once it has been flushed; both subclass the builtins.
+            while True:
+                try:
+                    chunks.append(sink.pull().to_ndarray())
+                except (BlockingIOError, EOFError):
+                    return
+
+        for frame in container.decode(stream):
+            graph.push(frame)
+            _drain()
+        graph.push(None)  # flush frames buffered inside the filter graph
+        _drain()
+
+    if not chunks:
+        raise RuntimeError(f"Decoded no audio samples from {input_path}")
+
+    # Each chunk is planar float32 shaped [1, samples] (mono layout).
+    waveform = np.concatenate(chunks, axis=1)
+    return torch.from_numpy(waveform).to(torch.float32)  # [1, T]
 
 
 def _waveform_to_fbank(

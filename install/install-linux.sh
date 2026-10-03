@@ -66,11 +66,6 @@ if [[ "$MODE" == "amd" ]]; then
     source "$SCRIPT_DIR/install-amd-post.sh"
 fi
 
-if [[ "$MODE" == "nvidia" ]]; then
-    echo "Installing FFmpeg with CUDA/NVDEC support..."
-    python "$PROJECT_ROOT/scripts/install_ffmpeg_cuda.py"
-fi
-
 echo "Running database migrations..."
 python "$PROJECT_ROOT/migrate.py"
 

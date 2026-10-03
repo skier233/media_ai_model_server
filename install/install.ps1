@@ -19,9 +19,6 @@ try {
 	Write-Output "Activating environment ai_model_server..."
 	conda activate ai_model_server
 
-	Write-Output 'Installing FFmpeg with CUDA/NVDEC support...'
-	python (Join-Path $ProjectRoot 'scripts/install_ffmpeg_cuda.py')
-
 	Write-Output 'Running migration'
 	python (Join-Path $ProjectRoot 'migrate.py')
 
