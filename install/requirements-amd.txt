@@ -3,8 +3,8 @@ pillow
 # AMD GPU requirements (Linux with ROCm)
 --extra-index-url https://download.pytorch.org/whl/rocm7.2
 
-torch==2.12.0
-torchvision==0.27.0
-torchaudio==2.11.0
+torch==2.12.0+rocm7.2
+torchvision==0.27.0+rocm7.2
+torchaudio==2.11.0+rocm7.2
 
 # Common dependencies
