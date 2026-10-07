@@ -133,7 +133,7 @@ class VideoPreprocessorModel(Model):
         _pbs = configValues.get("preprocess_batch_size", 32)
         self._preprocess_batch_size = max(1, int(_pbs) if _pbs else 32)
 
-        requested_backend = str(configValues.get("preprocess_backend", "deffcode_auto")).lower()
+        requested_backend = str(configValues.get("preprocess_backend", "av_auto")).lower()
 
         if requested_backend == "av":
             self._preprocess_backend = "av"
@@ -162,8 +162,10 @@ class VideoPreprocessorModel(Model):
             self._preprocess_backend = "deffcode"
             self._preprocess_callable = preprocess_video_deffcode
             self.logger.info("Video preprocessor using DeFFcode CPU backend")
-        else:
-            # Default: deffcode_auto — picks GPU or CPU per-video based on resolution.
+        elif requested_backend == "deffcode_auto":
+            # Legacy: picks GPU or CPU per-video based on resolution. The DeFFcode
+            # backends shell out to an ffmpeg executable, which is no longer
+            # installed by default — they are kept only for manual opt-in.
             if not torch.cuda.is_available():
                 self.logger.info(
                     "DeFFcode Auto selected and CUDA is not available; using DeFFcode CPU backend"
@@ -177,6 +179,18 @@ class VideoPreprocessorModel(Model):
                     "Video preprocessor using DeFFcode Auto backend (gpu_min_long_edge=%d)",
                     self._gpu_min_long_edge,
                 )
+        else:
+            # Default: PyAV, which needs no external ffmpeg binary.
+            if requested_backend:
+                self.logger.warning(
+                    "Unknown preprocess_backend %r; falling back to av_auto",
+                    requested_backend,
+                )
+            self._preprocess_backend = "av_auto"
+            self._preprocess_callable = preprocess_video_av_seek  # overridden per-request
+            self.logger.info(
+                "Video preprocessor using PyAV auto backend (seek when interval >= 1s, threaded otherwise)"
+            )
 
     def _should_skip_decode(self, itemFuture, input_names) -> bool:
         """True when no model downstream of this preprocessor will run."""

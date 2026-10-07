@@ -1,51 +1,25 @@
-FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
+# No nvidia/cuda base image: the torch cu132 wheels ship their own CUDA 13.2
+# runtime, cuDNN and cuBLAS via the nvidia-* pip packages, and TensorRT comes
+# from tensorrt_cu13_libs. The host driver (R580+) is injected at run time by
+# the NVIDIA Container Toolkit (`--gpus all` / the compose deploy block).
+FROM python:3.12-slim
 
-# Set environment variables
-ENV DEBIAN_FRONTEND=noninteractive
-ENV PYTHONUNBUFFERED=1
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    # These are what the nvidia/cuda base used to set. `video` is required so the
+    # toolkit also mounts libnvcuvid for the h264_cuvid / hevc_cuvid decoders.
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    wget \
-    curl \
-    bzip2 \
-    ca-certificates \
-    libglib2.0-0 \
-    libxext6 \
-    libsm6 \
-    libxrender1 \
-    git \
-    && rm -rf /var/lib/apt/lists/*
+# No system FFmpeg or OpenCV: PyAV bundles its own libav* (including the NVDEC
+# decoders) and all decoding runs in-process through it; resizing falls back to PIL.
 
-# Install Python 3.12
-RUN apt-get update && apt-get install -y software-properties-common && \
-    add-apt-repository ppa:deadsnakes/ppa && \
-    apt-get update && apt-get install -y python3.12 && \
-    wget https://bootstrap.pypa.io/get-pip.py && \
-    python3.12 get-pip.py && \
-    rm get-pip.py
+COPY install/requirements.txt install/requirements-base.txt ./
+RUN pip install -r requirements.txt
 
-# Set Python 3.12 as the default
-RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1
-
-# Install pip dependencies
-COPY install/requirements.txt .
-COPY install/requirements-base.txt .
-RUN python3.12 -m pip install -r requirements.txt
-
-# Install FFmpeg with CUDA/NVDEC support
-COPY scripts/install_ffmpeg_cuda.py /tmp/install_ffmpeg_cuda.py
-RUN python3.12 /tmp/install_ffmpeg_cuda.py --prefix /usr/local && rm /tmp/install_ffmpeg_cuda.py
-
-# Copy the wheel file and install it
 COPY dist/ai_processing-0.0.0-cp312-cp312-linux_x86_64.whl /tmp/
-RUN python3.12 -m pip install /tmp/ai_processing-0.0.0-cp312-cp312-linux_x86_64.whl
+RUN pip install /tmp/ai_processing-0.0.0-cp312-cp312-linux_x86_64.whl && rm /tmp/*.whl
 
-# Expose the port FastAPI runs on
 EXPOSE 8000
-
-# Set the working directory
 WORKDIR /app
-
-# Command to run the server.py script
-CMD ["python3.12", "server.py"]
+CMD ["python", "server.py"]
