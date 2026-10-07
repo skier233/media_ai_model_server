@@ -19,7 +19,7 @@ warnings.filterwarnings("ignore", message=".*buffer is not writable.*", category
 
 DEFAULT_MODEL_CAPABILITY = "tagging"
 DEFAULT_SUPPORTED_TARGET_SCOPES = ["asset", "frame", "region"]
-VALID_MODEL_CAPABILITIES = {"tagging", "detection", "embedding", "classification"}
+VALID_MODEL_CAPABILITIES = {"tagging", "detection", "embedding", "classification", "temporal_segmentation"}
 VALID_TARGET_SCOPES = {"asset", "frame", "region"}
 
 class AIModel(Model):

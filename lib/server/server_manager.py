@@ -365,7 +365,7 @@ def _build_dynamic_pipeline_config(pipeline_name, media_kind):
             ],
             "output": "results",
             "short_name": pipeline_name,
-            "version": 4.0,
+            "version": 4.1,
             "models": [
                 {
                     "name": "dynamic_video_ai",
@@ -381,7 +381,16 @@ def _build_dynamic_pipeline_config(pipeline_name, media_kind):
                     ],
                     "outputs": ["childrenResults"],
                 },
-                {"name": "video_result_postprocessor_v4", "inputs": ["childrenResults", "video_path", "time_interval"], "outputs": ["results"]},
+                {
+                    "name": "dynamic_asset_ai",
+                    "inputs": ["video_path", "vr_video", "skipped_categories", "requested_model_names"],
+                    "outputs": ["assetResults"],
+                },
+                {
+                    "name": "video_result_postprocessor_v4",
+                    "inputs": ["childrenResults", "video_path", "time_interval", "assetResults"],
+                    "outputs": ["results"],
+                },
             ],
         }
     return {
@@ -410,11 +419,15 @@ def _build_model_capability_entry(definition, media_kind):
         if detector_name and normalized_models:
             region_models[detector_name] = normalized_models
 
-    return {
+    entry = {
         "full_image_models": "ALL" if definition.use_all_full_image_models else full_image_models,
         "detector_models": detector_models,
         "region_models": region_models,
     }
+    if media_kind == "video":
+        asset_models = _normalize_model_list(definition.asset_models)
+        entry["asset_models"] = "ALL" if definition.use_all_asset_models else asset_models
+    return entry
 
 
 def _normalize_model_list(value):

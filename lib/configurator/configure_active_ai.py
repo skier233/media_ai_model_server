@@ -26,7 +26,7 @@ def save_active_ai_models(active_ai_models):
     save_active_ai_config({'active_ai_models': active_ai_models})
 
 # Model types that represent user-selectable AI models in the active AI selector.
-_AI_MODEL_TYPES = {"model", "face_torch_export", "visual_embedding", "audio_embedding", "audio_classifier"}
+_AI_MODEL_TYPES = {"model", "face_torch_export", "visual_embedding", "audio_embedding", "audio_classifier", "shot_boundary"}
 
 def load_available_ai_models():
     models = []

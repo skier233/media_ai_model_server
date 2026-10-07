@@ -7,6 +7,7 @@ read.  Models are wired to consume the output matching their spec's key.
 """
 
 from dataclasses import dataclass, replace
+import math
 import os
 from typing import Optional
 
@@ -172,6 +173,52 @@ class PreprocessSpec:
             normalization=-1, device="cpu",
             half_precision=False, max_long_edge=max_long_edge,
         )
+
+
+# ── Decode sizing ─────────────────────────────────────────────────────
+
+def vr_view_size(width: int, height: int) -> tuple:
+    """Size of the region ``vr_permute`` keeps from a ``width`` x ``height`` frame."""
+    if width / height > 1.5:
+        return width - width // 2, height
+    return 3 * width // 4 - width // 4, height // 2
+
+
+def decode_long_edge_for_specs(specs, source_width: int, source_height: int, vr_video: bool = False) -> int:
+    """Longest edge a video may be downscaled to at decode time, or 0 for no cap.
+
+    The decoded frame is the source every spec is resized from, so it has to
+    keep enough pixels for each of them on *both* axes. A spec's largest side
+    alone is not enough: a 512x512 squash of a 16:9 source needs 512 rows, and
+    capping the long edge at 512 leaves 288 that are then stretched back up.
+
+    A VR frame is cropped to one view after decoding, so the specs are sized
+    against that view and the cap is applied to the whole frame.
+    """
+    if not specs or source_width <= 0 or source_height <= 0:
+        return 0
+    view_width, view_height = (
+        vr_view_size(source_width, source_height) if vr_video else (source_width, source_height)
+    )
+    if view_width <= 0 or view_height <= 0:
+        return 0
+
+    scale = 0.0
+    for spec in specs:
+        if spec.width > 0 and spec.height > 0:
+            if spec.center_crop:
+                needed = min(spec.width, spec.height) / min(view_width, view_height)
+            else:
+                needed = max(spec.width / view_width, spec.height / view_height)
+        elif spec.max_long_edge > 0:
+            needed = spec.max_long_edge / max(view_width, view_height)
+        else:
+            return 0  # a native-resolution spec needs the full frame
+        scale = max(scale, needed)
+
+    if scale >= 1.0:
+        return 0
+    return math.ceil(max(source_width, source_height) * scale)
 
 
 # ── Tensor processing ─────────────────────────────────────────────────

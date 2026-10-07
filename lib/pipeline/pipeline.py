@@ -40,9 +40,11 @@ class Pipeline:
             if not model["name"]:
                 raise ValueError("Error: Model name must be a non-empty string!")
             modelName = model["name"]
-            if modelName in ["dynamic_video_ai", "dynamic_image_ai", "dynamic_region_ai", "dynamic_audio_ai", "dynamic_ai"]:
+            if modelName in ["dynamic_video_ai", "dynamic_image_ai", "dynamic_region_ai", "dynamic_audio_ai", "dynamic_asset_ai", "dynamic_ai"]:
                 if modelName == "dynamic_video_ai":
                     dynamic_models = dynamic_ai_manager.get_dynamic_video_ai_models(model["inputs"], model["outputs"], pipeline_name=pipeline_name)
+                elif modelName == "dynamic_asset_ai":
+                    dynamic_models = dynamic_ai_manager.get_dynamic_asset_ai_models(model["inputs"], model["outputs"], pipeline_name=pipeline_name)
                 elif modelName == "dynamic_image_ai":
                     dynamic_models = dynamic_ai_manager.get_dynamic_image_ai_models(model["inputs"], model["outputs"], pipeline_name=pipeline_name)
                 elif modelName == "dynamic_region_ai":
@@ -83,10 +85,19 @@ class Pipeline:
         matching_models = self._input_to_models.get(key)
         if matching_models is None:
             return
-        for model in matching_models:
-            allOtherInputsPresent = all(inputName in itemFuture.data for inputName in model.inputs if inputName != key)
-            if allOtherInputsPresent:
-                await model.model.add_to_queue(QueueItem(itemFuture, model.inputs, model.outputs))
+        # Decide which models this key completes before dispatching any of them.
+        # A model skipped for the request sets its outputs inside add_to_queue,
+        # and that nested event already dispatches whatever those outputs
+        # complete. Checking readiness one model at a time would then see the
+        # new outputs and dispatch the same model a second time for this key.
+        ready_models = [
+            model for model in matching_models
+            if all(inputName in itemFuture.data for inputName in model.inputs if inputName != key)
+        ]
+        for model in ready_models:
+            if itemFuture.data is None:
+                return
+            await model.model.add_to_queue(QueueItem(itemFuture, model.inputs, model.outputs))
 
     async def start_model_processing(self):
         for model in self.models:

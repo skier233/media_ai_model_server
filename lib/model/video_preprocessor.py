@@ -7,7 +7,8 @@ import threading
 import time
 
 import torch
-from lib.async_lib.async_processing import ItemFuture
+from lib.async_lib.async_processing import ItemFuture, model_skip_reason
+from lib.model.dense_frames import dense_stream_for
 from lib.model.model import Model
 from lib.model.preprocessing_python.image_preprocessing import (
     preprocess_video_deffcode,
@@ -17,8 +18,15 @@ from lib.model.preprocessing_python.image_preprocessing import (
     preprocess_video_av_seek,
     preprocess_video_mp_pyav,
     probe_keyframe_interval_seconds,
+    probe_video_dimensions,
 )
-from lib.pipeline.preprocess_spec import PreprocessSpec, apply_spec, apply_spec_batch
+from lib.model.preprocessing_python.ffmpeg_pipe import vr_crop_rect
+from lib.pipeline.preprocess_spec import (
+    PreprocessSpec,
+    apply_spec,
+    apply_spec_batch,
+    decode_long_edge_for_specs,
+)
 
 
 def compute_auto_pending_frames(per_frame_mb, ram_fraction, assumed_concurrency,
@@ -70,6 +78,25 @@ class VideoPreprocessorModel(Model):
 
         # Populated by the dynamic_ai_manager at pipeline construction.
         self.specs: list[PreprocessSpec] = []
+        # Config/file names of the models fed by this preprocessor, injected by
+        # DynamicAIManager so the decode can be skipped when none of them will
+        # run for a request. None means "not wired by the dynamic manager", and
+        # is distinct from an empty set, which means "nothing downstream at all".
+        self.downstream_model_names = None
+        # Spec key -> config/file names of the models that read that spec,
+        # injected by DynamicAIManager. A request that names its models gets
+        # only the specs those models read. None means "not wired": every spec
+        # is produced for every request.
+        self.spec_consumers = None
+        # Models that need every frame of the video (``requires_every_frame``),
+        # injected by DynamicAIManager. When one runs for a request, the video
+        # is decoded in full once and every frame is resized for that model
+        # only; everything else still gets just the interval frames.
+        self.dense_consumers = []
+        # Let the decoder drop frames nothing else references when sampling at
+        # an interval. Roughly twice as fast on sources with B-frames; a sample
+        # can land on the next decodable frame instead of its own.
+        self._skip_nonref = bool(configValues.get("skip_nonref_frames", True))
 
         # Cap how many preprocessed frames can be in-flight before the
         # preprocessor pauses to let inference catch up.  Preprocessed frames
@@ -165,8 +192,48 @@ class VideoPreprocessorModel(Model):
                 "Video preprocessor using PyAV auto backend (seek when interval >= 1s, threaded otherwise)"
             )
 
+    def _should_skip_decode(self, itemFuture, input_names) -> bool:
+        """True when no model downstream of this preprocessor will run."""
+        downstream = self.downstream_model_names
+        if downstream is None:
+            return False
+        if not downstream:
+            # No frame-scope model is active at all (e.g. a deployment with only
+            # an asset-scope model installed): nothing can consume these frames.
+            return True
+        requested = None
+        for name in ("dynamic_requested_model_names", "requested_model_names"):
+            if name in input_names and name in itemFuture.data:
+                requested = itemFuture[name]
+                break
+        if not requested:
+            return False
+        normalized = {str(value).strip() for value in requested if str(value).strip()}
+        return bool(normalized) and normalized.isdisjoint(downstream)
+
+    def _active_specs(self, requested_model_names) -> list:
+        """The specs a request needs: all of them unless it names its models."""
+        consumers = self.spec_consumers
+        if consumers is None or not requested_model_names:
+            return list(self.specs)
+        requested = {str(value).strip() for value in requested_model_names if str(value).strip()}
+        if not requested:
+            return list(self.specs)
+        selected = [spec for spec in self.specs if not requested.isdisjoint(consumers.get(spec.key, ()))]
+        # A requested model this map does not know still has to get its frames.
+        return selected or list(self.specs)
+
+    def _dense_models_for(self, skipped_categories, requested_model_names) -> list:
+        """The every-frame models that will run for a request. Uses the same
+        rule as their own skip gate, so the decode and the model agree."""
+        return [
+            model for model in self.dense_consumers
+            if model_skip_reason(model, skipped_categories, requested_model_names) is None
+        ]
+
     async def worker_function(self, data):
         for item in data:
+            dense_streams = []
             try:
                 preprocess_time = 0.0
                 itemFuture = item.item_future
@@ -174,6 +241,42 @@ class VideoPreprocessorModel(Model):
                 use_timestamps = itemFuture[item.input_names[1]]
                 frame_interval = itemFuture[item.input_names[2]] or self.frame_interval
                 vr_video = itemFuture[item.input_names[5]]
+
+                # Nothing downstream will run for this request, so decoding the
+                # video would produce thousands of child futures that all resolve
+                # to Skip(). The per-model skip gate cannot prevent this: it only
+                # applies to AI models, and a preprocessor is not one. Return an
+                # empty child list before the "no frames" guard below, which
+                # would otherwise treat this as a decode failure.
+                _skipped_categories = itemFuture[item.input_names[6]] if len(item.input_names) > 6 else None
+                _requested_names = itemFuture[item.input_names[7]] if len(item.input_names) > 7 else None
+                dense_models = self._dense_models_for(_skipped_categories, _requested_names)
+                frames_wanted = not self._should_skip_decode(itemFuture, item.input_names)
+                if not frames_wanted and not dense_models:
+                    self.logger.info(
+                        "Skipping video decode for '%s': no requested model uses this preprocessor.",
+                        input_data,
+                    )
+                    await itemFuture.set_data(item.output_names[0], [])
+                    continue
+
+                active_specs = self._active_specs(_requested_names) if frames_wanted else []
+                active_keys = {spec.key for spec in active_specs}
+
+                # One stream per every-frame model, grouped by clip size so each
+                # size is resized once however many models share it.
+                dense_sinks = []
+                if dense_models:
+                    root_future = getattr(itemFuture, "root_future", itemFuture)
+                    by_size = {}
+                    for model in dense_models:
+                        size = tuple(model.dense_frame_size())
+                        stream = dense_stream_for(
+                            root_future, getattr(model, "config_name", None) or model.model_file_name, *size)
+                        by_size.setdefault(size, []).append(stream)
+                        dense_streams.append(stream)
+                    dense_sinks = list(by_size.items())
+
                 children = []
                 frame_count = 0
                 preprocess_callable = self._preprocess_callable
@@ -190,7 +293,30 @@ class VideoPreprocessorModel(Model):
                 # When frame_interval >= GOP, each target lands on its own
                 # keyframe, so the cheap seek backend yields distinct frames
                 # without full decode (ideal for sparse sampling of long files).
-                if backend_used == "av_auto":
+                _source_size = probe_video_dimensions(input_data)
+                if dense_sinks:
+                    # Every frame has to be decoded anyway, so the parallel
+                    # decode serves the interval frames from the same pass.
+                    dense_crop = None
+                    if vr_video:
+                        if _source_size is None:
+                            raise RuntimeError(f"could not read the dimensions of '{input_data}'")
+                        dense_crop = vr_crop_rect(*_source_size)
+                    preprocess_callable = functools.partial(
+                        preprocess_video_mp_pyav,
+                        decode_workers=self._decode_workers,
+                        dense_sinks=dense_sinks,
+                        dense_crop=dense_crop,
+                        emit_interval=frames_wanted,
+                    )
+                    backend_used = "mp_pyav"
+                    self.logger.info(
+                        "Decoding every frame of '%s' for %s%s",
+                        input_data,
+                        ", ".join(getattr(m, "config_name", None) or m.model_file_name for m in dense_models),
+                        "" if frames_wanted else " (no interval frames requested)",
+                    )
+                elif backend_used == "av_auto":
                     gop_seconds = probe_keyframe_interval_seconds(input_data)
                     if gop_seconds is not None and gop_seconds > 0:
                         use_parallel = frame_interval < gop_seconds
@@ -205,6 +331,7 @@ class VideoPreprocessorModel(Model):
                         preprocess_callable = functools.partial(
                             preprocess_video_mp_pyav,
                             decode_workers=self._decode_workers,
+                            skip_nonref=self._skip_nonref,
                         )
                         backend_used = "mp_pyav"
                     else:
@@ -218,12 +345,14 @@ class VideoPreprocessorModel(Model):
                     )
 
                 # Determine the max decode resolution from the specs.
-                # If every spec has a finite cap we can let ffmpeg downscale
-                # at decode time → dramatically less per-frame data.
-                _spec_edges = [s.effective_resolution for s in self.specs]
+                # If every spec has a finite cap we can downscale at decode
+                # time → dramatically less per-frame data. The cap depends on
+                # the source's shape, so a source that cannot be probed is
+                # decoded at native resolution rather than guessed at.
                 _max_decode_long_edge = 0
-                if _spec_edges and all(e < 999_999 for e in _spec_edges):
-                    _max_decode_long_edge = max(_spec_edges)
+                if _source_size is not None:
+                    _max_decode_long_edge = decode_long_edge_for_specs(
+                        active_specs, _source_size[0], _source_size[1], vr_video=bool(vr_video))
 
                 # Decode at native (or capped) resolution — apply_spec handles
                 # per-model resize/normalize/device.  With norm_config=-1 the
@@ -303,7 +432,14 @@ class VideoPreprocessorModel(Model):
                 _result_q = queue.Queue(maxsize=_QUEUE_DEPTH)
                 _producer_error = []
                 _cumulative_cpu = [0.0]   # mutable float for thread
-                _requested_model_names = itemFuture[item.input_names[7]] if len(item.input_names) > 7 else None
+                _requested_model_names = _requested_names
+                # A spec no requested model reads is not produced, but its key
+                # is still set: the models wired to it are triggered by it,
+                # and that is where they report themselves skipped.
+                _unused_spec_names = [
+                    item.output_names[spec_start + index]
+                    for index, spec in enumerate(self.specs) if spec.key not in active_keys
+                ]
 
                 def _frame_producer():
                     # Apply each spec on its native device, in batches.  A batch
@@ -313,7 +449,8 @@ class VideoPreprocessorModel(Model):
                     # ping-pongs with the async inference pipeline; batching
                     # pushes that work onto the (idle) GPU in a handful of
                     # dispatches, so decode and inference actually overlap.
-                    _specs = list(self.specs)
+                    _specs = list(active_specs)
+                    _spec_names = [item.output_names[spec_start + self.specs.index(sp)] for sp in _specs]
                     _out_names = item.output_names
                     _ss = spec_start
                     _batch = []  # list of (frame_index, raw_frame CHW)
@@ -327,7 +464,7 @@ class VideoPreprocessorModel(Model):
                         del raws
                         for bi, (fidx, _) in enumerate(_batch):
                             st = {
-                                _out_names[_ss + si]: spec_batches[si][bi]
+                                _spec_names[si]: spec_batches[si][bi]
                                 for si in range(len(_specs))
                             }
                             _result_q.put((fidx, st))
@@ -415,6 +552,8 @@ class VideoPreprocessorModel(Model):
                                 _out_names[5]: _requested_model_names,
                             }
                             payload.update(spec_tensors)
+                            for _unused in _unused_spec_names:
+                                payload[_unused] = None
                             if frame_semaphore is not None:
                                 await frame_semaphore.acquire()
                             child = await ItemFuture.create(item, payload, item.item_future.handler)
@@ -456,7 +595,7 @@ class VideoPreprocessorModel(Model):
                         "Preprocessed %s frames in %.4f seconds (avg %.4f s/frame) using %s backend.",
                         frame_count, preprocess_time, avg_time, backend_used,
                     )
-                else:
+                elif frames_wanted:
                     error_msg = f"No frames were produced during preprocessing of '{input_data}' using {backend_used} backend."
                     self.logger.error(error_msg)
                     raise RuntimeError(error_msg)
@@ -471,12 +610,23 @@ class VideoPreprocessorModel(Model):
             except FileNotFoundError as fnf_error:
                 self.logger.error(f"File not found error: {fnf_error}")
                 self.logger.debug("Stack trace:", exc_info=True)
+                _fail_streams(dense_streams, fnf_error)
                 itemFuture.set_exception(fnf_error)
             except IOError as io_error:
                 self.logger.error(f"IO error (video might be corrupted): {io_error}")
                 self.logger.debug("Stack trace:", exc_info=True)
+                _fail_streams(dense_streams, io_error)
                 itemFuture.set_exception(io_error)
             except Exception as e:
                 self.logger.error(f"An unexpected error occurred: {e}")
                 self.logger.debug("Stack trace:", exc_info=True)
+                _fail_streams(dense_streams, e)
                 itemFuture.set_exception(e)
+
+
+def _fail_streams(streams, exception):
+    """Tell every-frame models still waiting on this request's decode that it
+    failed. A stream that already finished ignores it."""
+    for stream in streams:
+        if stream.segment_counts is None:
+            threading.Thread(target=stream.fail, args=(exception,), daemon=True).start()

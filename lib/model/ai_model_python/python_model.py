@@ -44,24 +44,28 @@ class PythonModel:
         """Run model without sigmoid, respecting keep_on_device setting."""
         return self.run_model(input_tensor, False)
 
-    def run_raw_multi_output(self, input_tensor):
+    def run_raw_multi_output(self, input_tensor, use_half=True):
         """Run model returning all output heads as a list of numpy arrays.
         For multi-output models (e.g. face detection).
+
+        ``use_half=False`` keeps the input dtype and disables autocast, for
+        architectures that are not numerically safe in fp16 (transformer
+        models with sinusoidal position encodings overflow in half).
         """
         input_tensor = input_tensor.to(self.device)
         # fp16 only pays off on an accelerator. On CPU it is emulated and runs
         # orders of magnitude slower, and torch.autocast("cpu") defaults to
         # bfloat16 -- which numpy cannot represent, so the .numpy() below would
         # fail with "Got unsupported ScalarType BFloat16". Run CPU in fp32.
-        on_cpu = self.device.type == "cpu"
-        if on_cpu:
+        half = use_half and self.device.type != "cpu"
+        if self.device.type == "cpu":
             if input_tensor.dtype != torch.float32:
                 input_tensor = input_tensor.float()
             autocast_ctx = nullcontext()
         else:
-            if input_tensor.dtype != torch.float16:
+            if half and input_tensor.dtype != torch.float16:
                 input_tensor = input_tensor.half()
-            autocast_ctx = torch.autocast(self.device.type, dtype=torch.float16, enabled=True)
+            autocast_ctx = torch.autocast(self.device.type, dtype=torch.float16, enabled=half)
         with torch.no_grad():
             with autocast_ctx:
                 outputs = self.model(input_tensor)

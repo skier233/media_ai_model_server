@@ -1,0 +1,5 @@
+type: python
+function_name: asset_result_collector
+max_queue_size: null
+max_batch_size: 50
+instance_count: 1

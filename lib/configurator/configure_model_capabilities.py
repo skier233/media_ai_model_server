@@ -39,6 +39,7 @@ DEFAULT_MODEL_CAPABILITIES_CONFIG = {
     "video_pipeline_dynamic_v4": {
         "full_image_models": "ALL",
         **copy.deepcopy(_DEFAULT_FACE_REGION_FLOW),
+        "asset_models": "ALL",
     },
     "audio_pipeline_v4": {
         "audio_models": "ALL",

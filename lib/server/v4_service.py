@@ -5,6 +5,7 @@ from lib.configurator.configure_active_ai import (
     load_active_ai_models,
     load_available_ai_models,
 )
+from lib.model.whole_asset import is_whole_asset_model
 
 
 VALID_LOAD_POLICIES = {"use_loaded", "load_if_cheap", "load_or_fail"}
@@ -36,6 +37,9 @@ def get_model_catalog(server_manager):
             incompatibility_reasons.append(f"Category already active: {', '.join(category_conflicts)}")
         if not artifact_available:
             incompatibility_reasons.append(f"Model file missing: {artifact_path}")
+        config_problem = _model_config_problem(model_config)
+        if config_problem:
+            incompatibility_reasons.append(config_problem)
         entry = {
             "config_name": config_name,
             "name": file_name,
@@ -51,6 +55,8 @@ def get_model_catalog(server_manager):
             "incompatibility_reason": "; ".join(incompatibility_reasons),
             "capabilities": _resolve_capabilities(model_config),
             "supported_scopes": _resolve_supported_scopes(model_config),
+            # Analyses a whole video and drives its own decode (e.g. shot boundaries).
+            "whole_asset": is_whole_asset_model(model_config),
             "active": config_name in active_model_names,
             "loaded": config_name in loaded_model_names or file_name in loaded_model_file_names,
         }
@@ -179,7 +185,18 @@ def resolve_want_model_names(server_manager, want, default_scope):
         requested_categories.update(_normalize_string_list(getattr(item, "model_category", None)) or [])
         requested_scopes = set(_normalize_string_list(getattr(item, "scope", None)) or [])
         requested_scopes.update(_normalize_string_list(getattr(item, "scopes", None)) or [])
-        if not requested_scopes and default_scope:
+        # On a video, an explicit capability or category ask must reach the
+        # models that analyse the whole video as well as the per-frame ones;
+        # the frame default alone would silently exclude them. Every other
+        # request keeps its default scope, and only a video request can match
+        # a whole-video model at all.
+        video_request = default_scope == "frame"
+        video_ask = (
+            video_request
+            and not requested_scopes
+            and bool(requested_capabilities or requested_categories)
+        )
+        if not requested_scopes and default_scope and not video_ask:
             requested_scopes.add(default_scope)
 
         matched = []
@@ -190,6 +207,10 @@ def resolve_want_model_names(server_manager, want, default_scope):
                 if requested_categories and requested_categories.isdisjoint(entry["categories"]):
                     continue
                 if requested_scopes and requested_scopes.isdisjoint(entry["supported_scopes"]):
+                    continue
+                if entry.get("whole_asset") and not video_request:
+                    continue
+                if video_ask and not ("frame" in entry["supported_scopes"] or entry.get("whole_asset")):
                     continue
                 matched.append(entry["config_name"])
             if not matched and not explicit_models:
@@ -288,6 +309,9 @@ def _validate_models_can_activate(model_names, current_active_model_names):
         artifact_available, artifact_path = _model_artifact_status(model_config)
         if not artifact_available:
             raise ValueError(f"Cannot activate model '{model_name}': model file missing: {artifact_path}")
+        config_problem = _model_config_problem(model_config)
+        if config_problem:
+            raise ValueError(f"Cannot activate model '{model_name}': {config_problem}")
 
         active_model_names.add(model_name)
         active_categories.update(categories)
@@ -306,8 +330,21 @@ def _model_artifact_status(model_config):
     candidates = [Path("./models") / f"{model_file_name}.pt2", Path("./models") / f"{model_file_name}.pt"]
     for candidate in candidates:
         if candidate.exists():
+            if is_whole_asset_model(model_config):
+                # A shot-boundary artifact is unusable without its label map.
+                sidecar = Path("./models") / f"{model_file_name}.labels.json"
+                if not sidecar.exists():
+                    return False, str(sidecar)
             return True, str(candidate)
     return False, str(candidates[0])
+
+
+def _model_config_problem(model_config):
+    """Why a model's configuration cannot work, or None."""
+    if is_whole_asset_model(model_config) and model_config.get("model_license_name"):
+        # The licensed runner cannot be asked for float32, which this model needs.
+        return "Shot-boundary artifacts must be unencrypted"
+    return None
 
 
 def _encrypted_model_extension(license_name):
