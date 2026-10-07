@@ -25,7 +25,7 @@ import time
 
 import numpy as np
 import torch
-import torchaudio
+from lib.utils.audio_ops import MelSpectrogram, resample
 
 from lib.async_lib.async_processing import ItemFuture
 from lib.model.model import Model
@@ -255,7 +255,7 @@ class AudioPreprocessorModel(Model):
         model_sr = model.samplerate  # 44100
 
         # Upsample to Demucs native SR and fake stereo
-        wav = torchaudio.functional.resample(waveform_16k, TARGET_SR, model_sr)
+        wav = resample(waveform_16k, TARGET_SR, model_sr)
         if wav.shape[0] == 1:
             wav = wav.repeat(2, 1)
         wav = wav.unsqueeze(0).to(device)  # [1, 2, T]
@@ -269,7 +269,7 @@ class AudioPreprocessorModel(Model):
 
         # Mono → resample back to 16 kHz
         vocals_mono = vocals.mean(dim=0, keepdim=True).cpu()  # [1, T]
-        vocals_16k = torchaudio.functional.resample(vocals_mono, model_sr, TARGET_SR)
+        vocals_16k = resample(vocals_mono, model_sr, TARGET_SR)
 
         self.logger.debug(
             f"[AudioPreprocessor] Vocals: {vocals_16k.shape[1] / TARGET_SR:.1f}s"
@@ -376,7 +376,7 @@ def _waveform_to_fbank(
       STFT → power spectrum (|STFT|²) → mel filterbank → amplitude_to_DB
     where amplitude_to_DB = 10 * log10(clamp(x, min=1e-10)), then top_db=80 clamping.
     """
-    fbank_transform = torchaudio.transforms.MelSpectrogram(
+    fbank_transform = MelSpectrogram(
         sample_rate=sample_rate,
         n_fft=400,
         win_length=400,
@@ -411,7 +411,7 @@ def _waveform_to_mel_spectrogram(
     target_length: int = 1024,
 ) -> torch.Tensor:
     """Convert waveform [1, T] to mel-spectrogram [1, n_mels, target_length]."""
-    mel_transform = torchaudio.transforms.MelSpectrogram(
+    mel_transform = MelSpectrogram(
         sample_rate=sample_rate,
         n_fft=400,
         hop_length=160,
@@ -437,7 +437,7 @@ def _apply_audio_spec(
 ) -> torch.Tensor:
     """Apply an AudioPreprocessSpec to a (possibly windowed) waveform."""
     if sample_rate != spec.sample_rate:
-        waveform = torchaudio.functional.resample(waveform, sample_rate, spec.sample_rate)
+        waveform = resample(waveform, sample_rate, spec.sample_rate)
         sample_rate = spec.sample_rate
 
     if spec.use_fbank:
