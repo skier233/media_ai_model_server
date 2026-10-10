@@ -362,3 +362,55 @@ def test_too_many_rejected_packets_fail_the_decode():
         emitter.rejected(_Packet(3), error)
     with pytest.raises(ValueError):
         emitter.rejected(_Packet(3), error)
+
+
+@pytest.fixture(scope="module")
+def indexed_flv(tmp_path_factory):
+    """FLV with a keyframe index whose video starts at 0.04s, like files from
+    old Flash video sites. Its demuxer refuses a seek to 0."""
+    path = tmp_path_factory.mktemp("flv") / "indexed.flv"
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+         "-i", "testsrc2=size=160x90:rate=25", "-t", "6",
+         "-pix_fmt", "yuv420p", "-c:v", "flv1", "-g", "25", "-output_ts_offset", "0.04",
+         "-flvflags", "add_keyframe_index", str(path)],
+        check=True,
+    )
+    return path
+
+
+@needs_ffmpeg
+def test_a_video_starting_after_zero_seeks_to_its_start(indexed_flv):
+    targets = list(mp_decode.iter_parallel_frames(indexed_flv, 0.5, 0, 4, True))
+    counts, frames = _dense_decode(indexed_flv, 0.5, 4)
+    _, reference = _dense_decode(indexed_flv, 0.5, 1)
+
+    assert len(targets) == 13
+    assert sum(counts) == len(reference) == 150
+    np.testing.assert_array_equal(frames, reference)
+
+
+def test_mpeg4_part_2_decodes_on_one_thread_for_every_frame_consumers():
+    assert mp_decode._thread_type("mpeg4", True) == "SLICE"
+    assert mp_decode._thread_type("mpeg4", False) == "AUTO"
+    assert mp_decode._thread_type("h264", True) == "AUTO"
+
+
+def test_a_refused_seek_back_to_zero_falls_back_to_the_stream_start():
+    class _Container:
+        def __init__(self):
+            self.seeks = []
+
+        def seek(self, position, stream):
+            self.seeks.append(position)
+            if position == 0:
+                raise PermissionError(1, "Operation not permitted")
+
+    class _Started(_Stream):
+        start_time = 40
+
+    container = _Container()
+    mp_decode._seek(container, _Started(), 0, fresh=True)
+    assert container.seeks == []
+    mp_decode._seek(container, _Started(), 0, fresh=False)
+    assert container.seeks == [0, 40]

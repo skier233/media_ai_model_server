@@ -69,7 +69,7 @@ def _decode_chunk_worker(path, start_idx, count, frame_interval, max_long_edge,
         container = av.open(str(path))
         try:
             stream = container.streams.video[0]
-            stream.thread_type = "AUTO"
+            stream.thread_type = _thread_type(stream.codec_context.name, bool(dense_sizes))
             if options.get("skip_nonref") and not dense_sizes:
                 stream.codec_context.skip_frame = "NONREF"
             time_base = stream.time_base
@@ -134,8 +134,10 @@ def _decode_from(container, stream, start_t, exact, tally=None):
     time_base = stream.time_base
     target = start_t
     backoff = 1.0
+    fresh = True
     while True:
-        container.seek(int(target / time_base), stream=stream)
+        _seek(container, stream, target, fresh)
+        fresh = False
         if tally is not None:
             tally.restart()
         frames = _decoded_frames(container, stream, tally)
@@ -157,6 +159,39 @@ def _decode_from(container, stream, start_t, exact, tally=None):
                 return itertools.chain(buffered, frames)
         target = max(0.0, start_t - backoff)
         backoff *= 2
+
+
+def _thread_type(codec_name, every_frame):
+    """The decoder threading for a chunk.
+
+    Frame threading is what makes PyAV decode fast, but FFmpeg's MPEG-4 Part 2
+    decoder returns different frames with it on files with packed B-frames, a
+    DivX/Xvid AVI convention, and differently again under load. The every-frame
+    consumers need the frames exactly, so they decode MPEG-4 Part 2 on one
+    thread per chunk; the chunks still run in parallel.
+    """
+    if every_frame and codec_name == "mpeg4":
+        return "SLICE"  # the decoder has no slice threading, so: one thread
+    return "AUTO"
+
+
+def _seek(container, stream, target, fresh):
+    """Seek to ``target`` seconds.
+
+    A container that was just opened is at the start already, and is not
+    sought to 0: an FLV with a keyframe index whose video starts after 0
+    refuses that seek with EPERM. A seek back to 0 later falls back to the
+    stream's own start time for the same reason. It is not used first because
+    an MPEG-TS seek to its start time can land after the first keyframe.
+    """
+    if fresh and target <= 0:
+        return
+    try:
+        container.seek(int(target / stream.time_base), stream=stream)
+    except PermissionError:
+        if target > 0 or stream.start_time is None:
+            raise
+        container.seek(stream.start_time, stream=stream)
 
 
 def _decoded_frames(container, stream, tally):
