@@ -1225,7 +1225,12 @@ def preprocess_video_mp_pyav(
     streams, for models that need every frame. ``dense_crop`` is applied to
     those frames before the resize. ``emit_interval`` False decodes for the
     dense sinks only and yields no frames.
+
+    When the decode cannot deliver every frame, for example because the video
+    is damaged, the dense streams fail and the interval frames keep coming: the
+    analyses that sample frames do not depend on every one of them.
     """
+    from lib.model.dense_frames import DenseStreamError
     from lib.model.preprocessing_python.mp_decode import iter_parallel_frames
 
     video_path = _validate_local_video_source(video_path)
@@ -1248,13 +1253,24 @@ def preprocess_video_mp_pyav(
     dense_sinks = list(dense_sinks or [])
     streams = [stream for _size, sink_streams in dense_sinks for stream in sink_streams]
     segment_counts = {}
+    dense_failure = []
 
     def _on_dense(segment, size_index, frames):
+        if dense_failure:
+            return
         for stream in dense_sinks[size_index][1]:
             stream.put(segment, frames)
 
     def _on_segment(segment, count):
         segment_counts[segment] = count
+
+    def _on_dense_failed(segment, message):
+        if dense_failure:
+            return
+        _LOGGER.warning("Every-frame decode of '%s' failed; interval frames continue: %s", video_path, message)
+        dense_failure.append(DenseStreamError(f"cannot decode every frame of '{video_path}': {message}"))
+        for stream in streams:
+            stream.fail(dense_failure[0])
 
     # The decode (av) runs in child processes; the torch transform stays in this
     # parent process where the rest of the pipeline lives.
@@ -1266,6 +1282,7 @@ def preprocess_video_mp_pyav(
             dense_crop=dense_crop,
             on_dense=_on_dense if dense_sinks else None,
             on_segment=_on_segment if dense_sinks else None,
+            on_dense_failed=_on_dense_failed if dense_sinks else None,
             emit_interval=emit_interval,
         ):
             result = _prepare_frame(frame_np, device, vr_video, frame_transforms)
@@ -1276,6 +1293,8 @@ def preprocess_video_mp_pyav(
         for stream in streams:
             stream.fail(exc if isinstance(exc, Exception) else RuntimeError("the decode was stopped early"))
         raise
+    if dense_failure:
+        return
     counts = [segment_counts[segment] for segment in sorted(segment_counts)]
     for stream in streams:
         stream.finish(counts)
