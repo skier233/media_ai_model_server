@@ -12,6 +12,7 @@ the thing that throttles in-process (threaded) PyAV decode.  Only the small,
 already-downscaled frames cross the process boundary.
 """
 
+import itertools
 import math
 import multiprocessing as mp
 from typing import Optional
@@ -57,11 +58,10 @@ def _decode_chunk_worker(path, start_idx, count, frame_interval, max_long_edge,
             tol = 0.5 / average_rate if average_rate > 0 else 0.02
 
             start_t = start_idx * frame_interval
-            container.seek(int(start_t / time_base), stream=stream)
-
             dense = _DenseEmitter(options, start_t, stream, out_queue) if dense_sizes else None
+            exact = dense is not None and dense.needs_exact_start
             produced = 0
-            for frame in container.decode(video=0):
+            for frame in _decode_from(container, stream, start_t, exact):
                 if frame.pts is None:
                     continue
                 ft = float(frame.pts * time_base)
@@ -95,6 +95,45 @@ def _decode_chunk_worker(path, start_idx, count, frame_interval, max_long_edge,
         out_queue.put(None)  # done sentinel
 
 
+def _decode_from(container, stream, start_t, exact):
+    """Seek to ``start_t`` and return the decoded frames from there.
+
+    A seek lands on the keyframe whose *decode* time is at or before the
+    target, and that keyframe can still be displayed after it: with B-frames a
+    keyframe is displayed later than it is decoded, and in an open GOP the
+    frames displayed just before it reference the previous GOP, so the decoder
+    drops them after the seek. With ``exact``, a seek whose first frame is
+    after ``start_t``, or that yields no frame at all, is retried from further
+    back until it is not. That costs decoding from an earlier keyframe, and
+    only for the seeks that land late.
+    """
+    time_base = stream.time_base
+    target = start_t
+    backoff = 1.0
+    while True:
+        container.seek(int(target / time_base), stream=stream)
+        frames = (frame for frame in container.decode(video=0) if frame.pts is not None)
+        if not exact or target <= 0:
+            return frames
+        first = next(frames, None)
+        # No frame at all is a seek that landed too late as well: formats whose
+        # index is not keyframe-accurate, such as MPEG-TS, can land mid-GOP
+        # after the last keyframe, and the decoder then drops everything to EOF.
+        if first is not None and not _starts_after(first, float(first.pts * time_base), start_t, stream):
+            return itertools.chain([first], frames)
+        target = max(0.0, start_t - backoff)
+        backoff *= 2
+
+
+def _starts_after(frame, ft, start_t, stream):
+    """Whether decoding from ``frame`` misses frames displayed from ``start_t`` on.
+
+    The stream's own first frame misses nothing, wherever it is displayed.
+    """
+    first_pts = stream.start_time
+    return ft > start_t + 1e-9 and not (first_pts is not None and frame.pts <= first_pts)
+
+
 class _DenseEmitter:
     """Resizes every frame of one segment for the every-frame consumers."""
 
@@ -110,20 +149,24 @@ class _DenseEmitter:
         self._segment = int(options.get("segment", 0))
         self._start = start_t if self._segment > 0 else None
         self._end = options.get("segment_end")
-        self._first_pts = stream.start_time
+        self._stream = stream
         self._out = out_queue
         self._clips = [[] for _ in self._sizes]
         self._seen_any = False
         self.count = 0
         self.finished = False
 
+    @property
+    def needs_exact_start(self):
+        """Whether decoding must start at or before this segment's first frame."""
+        return self._start is not None
+
     def add(self, frame, ft):
         if not self._seen_any:
             self._seen_any = True
-            # The seek must land at or before the segment's first frame, or the
-            # frames in between would silently be missing from the video.
-            if (self._start is not None and ft > self._start + 1e-9
-                    and not (self._first_pts is not None and frame.pts <= self._first_pts)):
+            # _decode_from starts at or before the segment's first frame. Check
+            # anyway: frames missing here would silently shift the whole video.
+            if self._start is not None and _starts_after(frame, ft, self._start, self._stream):
                 raise RuntimeError(
                     f"seek for segment {self._segment} landed at {ft:.3f}s, "
                     f"after its start {self._start:.3f}s"
