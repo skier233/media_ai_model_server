@@ -25,14 +25,6 @@ _LOGGER = logging.getLogger("logger")
 # Frames per dense clip handed to the parent. Purely a transport size.
 DENSE_CLIP_FRAMES = 100
 
-# Packets the decoder may reject in one chunk before the chunk fails; more
-# than this means the file is unreadable, not damaged. A chunk that feeds the
-# every-frame consumers fails past it (see _DenseEmitter). A chunk that only
-# samples frames fails only when they are also more than MAX_REJECTED_SHARE of
-# its packets, so one damaged stretch of a long chunk costs only its frames.
-MAX_REJECTED_PACKETS = 32
-MAX_REJECTED_SHARE = 0.1
-
 # Frames at either end of a video that no decoder can produce are left out of
 # the every-frame delivery when they span at most this long: at the start,
 # frames of a cut file that reference a keyframe before its first; at the end,
@@ -99,7 +91,7 @@ def _decode_chunk_worker(path, start_idx, count, frame_interval, max_long_edge,
             dense = _DenseEmitter(options, start_t, stream, out_queue) if dense_sizes else None
             exact = dense is not None and dense.needs_exact_start
             produced = 0
-            rejects = _Rejects(stream) if dense is None else None
+            rejects = _Rejects(stream)
             for frame in _decode_from(container, stream, start_t, exact, dense, tol, rejects):
                 ft = float(frame.pts * time_base)
                 if dense is not None and not dense.finished:
@@ -121,11 +113,12 @@ def _decode_chunk_worker(path, start_idx, count, frame_interval, max_long_edge,
                     break
             if dense is not None:
                 dense.close()
-            if rejects is not None and rejects.count:
-                if rejects.unreadable():
-                    raise RuntimeError(
-                        f"the decoder rejected {rejects.count} of {rejects.packets} packets: {rejects.first}")
-                out_queue.put(("__rejected__", start_t, rejects.count, rejects.first))
+            if rejects.count:
+                # Rejections measure packet errors, not whether sampling
+                # succeeded. A damaged stretch may exceed a chunk-local ratio
+                # even when every requested sample was delivered after recovery.
+                out_queue.put(("__rejected__", start_t, rejects.count, rejects.first,
+                               rejects.packets, produced))
         finally:
             container.close()
     except Exception as exc:  # surface to the parent as a sentinel payload
@@ -269,16 +262,16 @@ def _decoded_frames(container, stream, tally, rejects=None):
     for packet in container.demux(stream):
         if tally is not None:
             tally.packet(packet)
-        elif rejects is not None:
+        if rejects is not None:
             rejects.packets += 1
         try:
             frames = packet.decode()
         except av.error.InvalidDataError as exc:
+            if rejects is not None:
+                rejects.add(packet, exc)
             if tally is not None:
                 tally.rejected(packet, exc)
-            elif rejects is not None:
-                rejects.add(packet, exc)
-            else:
+            elif rejects is None:
                 raise
             continue
         for frame in frames:
@@ -298,12 +291,12 @@ def _starts_after(frame, ft, start_t, stream):
 
 
 class _Rejects:
-    """Packets the decoder rejected in a chunk that only samples frames.
+    """Diagnostic packet-error counters shared by interval and dense decoding.
 
     Damage in a file, such as a broken packet in a download, costs the frames
     that depend on it; a sample that would land on one of them takes the next
-    frame that decodes. Only a chunk the decoder rejects throughout is
-    unreadable; see :data:`MAX_REJECTED_SHARE`.
+    frame that decodes. These counters are diagnostic only: a packet-error
+    ratio cannot determine whether interval sampling succeeded.
     """
 
     def __init__(self, stream):
@@ -317,9 +310,6 @@ class _Rejects:
         if self.first is None:
             at = "" if packet.pts is None else f" at or before {float(packet.pts * self._time_base):.3f}s"
             self.first = f"{type(exc).__name__}{at}: {exc}"
-
-    def unreadable(self):
-        return self.count > MAX_REJECTED_PACKETS and self.count > MAX_REJECTED_SHARE * self.packets
 
 
 class _DenseEmitter:
@@ -364,7 +354,6 @@ class _DenseEmitter:
         self._packet_pts = set()
         self._frame_pts = set()
         self._last_ft = None
-        self._rejected = 0
         self.failed = False
         self.count = 0
         self.finished = False
@@ -408,9 +397,6 @@ class _DenseEmitter:
                 and float((self._first_pts - pts) * self._stream.time_base) <= EDGE_GAP_SECONDS)
 
     def rejected(self, packet, exc):
-        self._rejected += 1
-        if self._rejected > MAX_REJECTED_PACKETS:
-            raise exc
         if not self.finished:
             at = "" if packet.pts is None else f" at or before {float(packet.pts * self._stream.time_base):.3f}s"
             self._fail(f"the decoder rejected a packet{at}: {type(exc).__name__}: {exc}")
@@ -606,6 +592,9 @@ def iter_parallel_frames(path, frame_interval, max_long_edge, decode_workers,
 
     finished = 0
     error = None
+    sampled = 0
+    rejected = 0
+    first_rejection = None
     try:
         while finished < len(procs):
             crashed = [p for p in procs if getattr(p, "exitcode", None) not in (None, 0)]
@@ -630,10 +619,14 @@ def iter_parallel_frames(path, frame_interval, max_long_edge, decode_workers,
                         on_dense(item[1], item[2], item[3])
                     continue
                 if item[0] == "__rejected__":
+                    rejected += item[2]
+                    if first_rejection is None:
+                        first_rejection = item[3]
                     _LOGGER.warning(
                         "Skipped %d damaged packet(s) decoding '%s' in the part from %.1fs; "
-                        "samples there take the next frame that decodes. First: %s",
-                        item[2], path, item[1], item[3])
+                        "read %d packets and produced %d interval sample(s). "
+                        "Samples there take the next frame that decodes. First: %s",
+                        item[2], path, item[1], item[4], item[5], item[3])
                     continue
                 if item[0] == "__segment__":
                     if on_segment is not None:
@@ -647,9 +640,14 @@ def iter_parallel_frames(path, frame_interval, max_long_edge, decode_workers,
                     if not emit_interval:
                         break
                     continue
+            sampled += 1
             yield item
         if error is not None:
             raise error
+        if emit_interval and sampled == 0 and rejected:
+            raise RuntimeError(
+                f"no interval frames could be decoded; the decoder rejected {rejected} packets. "
+                f"First: {first_rejection}")
     finally:
         for proc in procs:
             if proc.is_alive():

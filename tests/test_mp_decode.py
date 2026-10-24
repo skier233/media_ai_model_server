@@ -251,25 +251,102 @@ def test_a_damaged_frame_does_not_fail_an_interval_only_decode(damaged_clip, cap
     assert "damaged packet" in caplog.text
 
 
-def test_a_chunk_is_unreadable_only_when_most_of_it_is_rejected():
-    """A long chunk with one damaged stretch keeps going; a chunk the decoder
-    rejects throughout fails."""
-    error = ValueError("rejected")
-    rejects = mp_decode._Rejects(_Stream())
-    rejects.packets = 5000
-    for _ in range(mp_decode.MAX_REJECTED_PACKETS + 100):
-        rejects.add(_Packet(3), error)
-    assert not rejects.unreadable()
-    assert rejects.first == "ValueError at or before 3.000s: rejected"
+@pytest.fixture(scope="module")
+def badly_damaged_clips(damaged_clip, tmp_path_factory):
+    """Preserve MP4 metadata; corrupt over 32 packets and over 10% of the
+    stream, with a clean keyframe after the damaged stretch for recovery."""
+    import av
 
-    rejects.packets = 200
-    assert rejects.unreadable()
+    _damaged, clean = damaged_clip
+    folder = tmp_path_factory.mktemp("burst_damage")
+    burst, unreadable = folder / "burst.mp4", folder / "unreadable.mp4"
+    burst_data = bytearray(clean.read_bytes())
+    unreadable_data = bytearray(burst_data)
+    broken = 0
+    with av.open(str(clean)) as container:
+        stream = container.streams.video[0]
+        for packet in container.demux(stream):
+            if packet.size <= 4 or packet.pts is None:
+                continue
+            at = packet.pos
+            unreadable_data[at:at + 4] = b"\x7f\xff\xff\xff"
+            if 1.0 <= float(packet.pts * stream.time_base) < 2.5:
+                burst_data[at:at + 4] = b"\x7f\xff\xff\xff"
+                broken += 1
+    assert broken > 32
+    burst.write_bytes(burst_data)
+    unreadable.write_bytes(unreadable_data)
+    return burst, unreadable, clean
 
-    rejects = mp_decode._Rejects(_Stream())
-    rejects.packets = 40
-    for _ in range(mp_decode.MAX_REJECTED_PACKETS):
-        rejects.add(_Packet(3), error)
-    assert not rejects.unreadable()
+
+@needs_ffmpeg
+@pytest.mark.parametrize("workers", [1, 4])
+def test_many_packet_errors_do_not_discard_recovered_samples(badly_damaged_clips, workers, caplog):
+    burst, _unreadable, clean = badly_damaged_clips
+    targets = sorted(target for target, _ in mp_decode.iter_parallel_frames(burst, 0.5, 0, workers, True))
+    expected = sorted(target for target, _ in mp_decode.iter_parallel_frames(clean, 0.5, 0, workers, True))
+    assert targets == expected == [index * 0.5 for index in range(8)]
+    assert "damaged packet" in caplog.text and "produced" in caplog.text
+
+
+@needs_ffmpeg
+def test_many_packet_errors_fail_only_the_dense_branch(badly_damaged_clips):
+    burst, _unreadable, clean = badly_damaged_clips
+    targets, failures = _shared_decode(burst, 0.5)
+    expected, _ = _shared_decode(clean, 0.5)
+    assert targets == expected
+    assert failures and all("the decoder rejected a packet" in message for message in failures)
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("workers", [1, 4])
+def test_a_video_without_any_decodable_samples_still_fails(badly_damaged_clips, workers):
+    _burst, unreadable, _clean = badly_damaged_clips
+    with pytest.raises(RuntimeError, match="no interval frames could be decoded"):
+        list(mp_decode.iter_parallel_frames(unreadable, 0.5, 0, workers, True))
+
+
+def test_an_empty_damaged_chunk_does_not_discard_samples_from_other_chunks(monkeypatch, caplog):
+    import queue
+
+    class Context:
+        def Queue(self, maxsize):
+            self.queue = queue.Queue()
+            return self.queue
+
+        def Process(self, target, args, daemon):
+            context = self
+            start = args[1]
+            class Process:
+                def start(self):
+                    if start == 0:
+                        context.queue.put(("__rejected__", 0, 70, "InvalidDataError", 100, 0))
+                    else:
+                        context.queue.put((3.0, "decodable frame"))
+                    context.queue.put(None)
+
+                def is_alive(self):
+                    return False
+
+                def join(self, timeout):
+                    pass
+            return Process()
+
+    monkeypatch.setattr(mp_decode.mp, "get_context", lambda _: Context())
+    monkeypatch.setattr(mp_decode, "probe_duration_seconds", lambda _: 4)
+    assert list(mp_decode.iter_parallel_frames("synthetic.mp4", 1, 0, 2, True)) == [(3.0, "decodable frame")]
+    assert "produced 0 interval sample(s)" in caplog.text
+
+
+def test_unrelated_decode_errors_are_not_treated_as_damaged_packets():
+    class BrokenPacket(_Packet):
+        def decode(self):
+            raise OSError("disk read failed")
+    class Container:
+        def demux(self, _stream):
+            return [BrokenPacket(0)]
+    with pytest.raises(OSError, match="disk read failed"):
+        list(mp_decode._decoded_frames(Container(), _Stream(), None, mp_decode._Rejects(_Stream())))
 
 
 @needs_ffmpeg
@@ -475,15 +552,13 @@ def test_a_frame_without_a_timestamp_fails_the_segment():
                     "segment 1: a frame has no timestamp, so it cannot be placed in the video")]
 
 
-def test_too_many_rejected_packets_fail_the_decode():
-    """A file the decoder rejects throughout is unreadable, not damaged, and
-    fails the whole request as before."""
+def test_repeated_packet_errors_fail_the_dense_stream_once_without_aborting_sampling():
     emitter, _out = _emitter()
     error = ValueError("rejected")
-    for _ in range(mp_decode.MAX_REJECTED_PACKETS):
+    for _ in range(100):
         emitter.rejected(_Packet(3), error)
-    with pytest.raises(ValueError):
-        emitter.rejected(_Packet(3), error)
+    assert emitter.failed
+    assert len(_out) == 1 and _out[0][0] == "__dense_failed__"
 
 
 @pytest.fixture(scope="module")
