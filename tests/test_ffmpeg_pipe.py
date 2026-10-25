@@ -282,7 +282,7 @@ def test_probe_flags_a_frame_rate_it_had_to_assume(monkeypatch):
     ctx = types.SimpleNamespace(name="h264", codec=None, width=640, height=360,
                                 pix_fmt="yuv420p", field_order=None)
     stream = types.SimpleNamespace(
-        codec_context=ctx, average_rate=None, guessed_rate=None, duration=None, time_base=None,
+        disposition=0, codec_context=ctx, average_rate=None, guessed_rate=None, duration=None, time_base=None,
         frames=0, color_range=None, colorspace=None,
     )
 
@@ -411,7 +411,7 @@ def test_probe_reports_the_codec_not_the_decoder(monkeypatch):
         width=3840, height=2160, pix_fmt="yuv420p10le", field_order=None,
     )
     stream = types.SimpleNamespace(
-        codec_context=ctx, average_rate=30, guessed_rate=None, duration=None, time_base=None,
+        disposition=0, codec_context=ctx, average_rate=30, guessed_rate=None, duration=None, time_base=None,
         frames=300, color_range=None, colorspace=None,
     )
 
@@ -438,7 +438,7 @@ def test_probe_falls_back_to_the_context_name(monkeypatch):
     ctx = types.SimpleNamespace(name="h264", codec=None, width=1920, height=1080,
                                 pix_fmt="yuv420p", field_order=None)
     stream = types.SimpleNamespace(
-        codec_context=ctx, average_rate=25, guessed_rate=None, duration=None, time_base=None,
+        disposition=0, codec_context=ctx, average_rate=25, guessed_rate=None, duration=None, time_base=None,
         frames=100, color_range=None, colorspace=None,
     )
 
