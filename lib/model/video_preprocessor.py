@@ -34,6 +34,10 @@ from lib.pipeline.preprocess_spec import (
 MAX_AUTO_PENDING_FRAMES = 4096
 RESULT_QUEUE_DEPTH = 64
 CONSUMER_BATCH_SIZE = 64
+# Item-future key holding the interval the video was actually sampled at: the
+# requested one, or the configured frame_interval when none was requested.
+# Result builders report this instead of the request's raw value.
+EFFECTIVE_FRAME_INTERVAL_KEY = "effective_frame_interval"
 
 
 def compute_auto_pending_frames(per_frame_mb, ram_fraction, assumed_concurrency,
@@ -270,6 +274,9 @@ class VideoPreprocessorModel(Model):
                 input_data = itemFuture[item.input_names[0]]
                 use_timestamps = itemFuture[item.input_names[1]]
                 frame_interval = itemFuture[item.input_names[2]] or self.frame_interval
+                # Not written back to the request's own key: setting an input
+                # again would dispatch the models that consume it a second time.
+                await itemFuture.set_data(EFFECTIVE_FRAME_INTERVAL_KEY, frame_interval)
                 vr_video = itemFuture[item.input_names[5]]
 
                 # Nothing downstream will run for this request, so decoding the

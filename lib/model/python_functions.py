@@ -14,6 +14,7 @@ from lib.model.postprocessing.AI_VideoResult import AIVideoResult, AIVideoResult
 import lib.model.postprocessing.timeframe_processing as timeframe_processing
 from lib.model.postprocessing.category_settings import category_config
 from lib.model.skip_input import Skip
+from lib.model.video_preprocessor import EFFECTIVE_FRAME_INTERVAL_KEY
 from lib.model.postprocessing.post_processing_settings import get_or_default, post_processing_config
 from lib.pipeline.target_primitives import build_region_target, targets_to_dicts
 
@@ -172,11 +173,19 @@ async def _join_child_futures(parent_future, child_futures, output_name):
         except Exception:
             pass
 
+def _effective_frame_interval(itemFuture, item):
+    """The interval the video was sampled at. The preprocessor records it;
+    without that, the request's value, then 0.5."""
+    frame_interval = itemFuture[EFFECTIVE_FRAME_INTERVAL_KEY]
+    if frame_interval is None:
+        frame_interval = itemFuture[item.input_names[2]]
+    return float(frame_interval) if frame_interval is not None else 0.5
+
 async def video_result_postprocessor(data):
     for item in data:
         itemFuture = item.item_future
         duration = get_video_duration_av(itemFuture[item.input_names[1]])
-        result = {"frames": itemFuture[item.input_names[0]], "video_duration": duration, "frame_interval": float(itemFuture[item.input_names[2]]), "threshold": float(itemFuture[item.input_names[3]]), "ai_models_info": itemFuture['pipeline'].get_ai_models_info()}
+        result = {"frames": itemFuture[item.input_names[0]], "video_duration": duration, "frame_interval": _effective_frame_interval(itemFuture, item), "threshold": float(itemFuture[item.input_names[3]]), "ai_models_info": itemFuture['pipeline'].get_ai_models_info()}
         del itemFuture.data["pipeline"]
 
         videoResult = itemFuture[item.input_names[4]]
@@ -201,14 +210,13 @@ async def video_result_postprocessor_v3(data):
         timespan_frames = _filter_timespan_compatible_frames(clean_frames)
         per_frame_data = _extract_per_frame_data(clean_frames)
 
-        raw_frame_interval = itemFuture[item.input_names[2]]
         raw_threshold = itemFuture[item.input_names[3]]
 
         result = {
             "frames": timespan_frames,
             "per_frame_data": per_frame_data,
             "video_duration": duration,
-            "frame_interval": float(raw_frame_interval) if raw_frame_interval is not None else 0.5,
+            "frame_interval": _effective_frame_interval(itemFuture, item),
             "threshold": float(raw_threshold) if raw_threshold is not None else 0.5,
             "ai_models_info": currently_active_models,
             "skipped_categories": itemFuture[item.input_names[4]],
@@ -443,13 +451,12 @@ async def video_result_postprocessor_v4(data):
             del itemFuture.data["pipeline"]
 
         metrics = _collect_pipeline_metrics(itemFuture, current_models)
-        raw_frame_interval = itemFuture[item.input_names[2]]
         payload = {
             "asset_id": str(itemFuture[item.input_names[1]]),
             "requested_model_names": requested_model_names,
             "models": used_models,
             "duration_seconds": duration,
-            "frame_interval_seconds": float(raw_frame_interval) if raw_frame_interval is not None else 0.5,
+            "frame_interval_seconds": _effective_frame_interval(itemFuture, item),
             "frame_count": len(normalized_frames),
             "frames": normalized_frames,
             "metrics": metrics,
