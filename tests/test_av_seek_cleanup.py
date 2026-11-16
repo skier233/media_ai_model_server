@@ -79,6 +79,36 @@ def test_decode_failure_closes_and_reaches_the_consumer(monkeypatch):
     assert container.closed.is_set()
 
 
+def test_initial_zero_seek_is_not_required(monkeypatch):
+    container = Container()
+    targets = []
+
+    def seek(offset, **_kwargs):
+        targets.append(offset)
+        if offset == 0:
+            raise av.error.PermissionError(1, "Operation not permitted")
+
+    container.seek = seek
+    frames = list(source(monkeypatch, container))
+    assert [target for target, _ in frames] == [0, 1, 2]
+    assert targets == [1, 2]
+    assert container.closed.is_set()
+
+
+def test_permission_failure_on_later_seek_is_not_silently_skipped(monkeypatch):
+    container = Container()
+
+    def seek(*_args, **_kwargs):
+        raise av.error.PermissionError(1, "Operation not permitted")
+
+    container.seek = seek
+    frames = source(monkeypatch, container)
+    assert next(frames)[0] == 0
+    with pytest.raises(av.error.PermissionError):
+        list(frames)
+    assert container.closed.is_set()
+
+
 def test_early_close_stops_a_producer_blocked_on_a_full_queue(monkeypatch):
     container = Container()
     container.streams.video[0].duration = 10_000
