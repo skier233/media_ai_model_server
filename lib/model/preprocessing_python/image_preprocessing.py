@@ -1108,8 +1108,6 @@ def preprocess_video_av_seek(
         if not frame_interval or frame_interval <= 0:
             frame_interval = 1.0 / (float(stream.average_rate) if stream.average_rate else 30.0)
 
-        time_base = stream.time_base
-
         # ---- prefetch machinery ----
         # The background thread runs ONLY the GIL-free C-level work: seek,
         # decode, to_ndarray, and optional resize.  All Python/torch work
@@ -1132,12 +1130,17 @@ def preprocess_video_av_seek(
 
         def _prefetch_worker():
             """Seek-decode loop that feeds *prefetch_q* with raw numpy frames."""
+            from lib.model.preprocessing_python.mp_decode import _seek
+
             try:
                 idx = 0
                 t = 0.0
                 while t < duration and not stop.is_set():
                     try:
-                        container.seek(int(t / time_base), stream=stream)
+                        # A freshly opened input is already at its beginning.
+                        # Some valid AVI/FLV indexes refuse a seek to zero
+                        # with EPERM even though decoding works normally.
+                        _seek(container, stream, t, fresh=(idx == 0))
                         if stop.is_set():
                             break
                         frame = None
