@@ -20,6 +20,8 @@ import numpy as np
 
 from lib.pipeline.preprocess_spec import NORMALIZATION_PRESETS
 
+from lib.model.preprocessing_python.video_stream import select_video_stream
+
 
 _DEFFCODE_LOG_SUPPRESSIONS = (
     "Manually discarding `frame_format`",
@@ -290,7 +292,7 @@ def get_video_duration_av(video_path):
     import av
     video_path = _validate_local_video_source(video_path)
     with av.open(str(video_path)) as container:
-        stream = container.streams.video[0]
+        stream = select_video_stream(container)
         if stream.duration and stream.time_base:
             return float(stream.duration * stream.time_base)
         if container.duration:
@@ -437,7 +439,7 @@ def probe_keyframe_interval_seconds(
         import av
 
         with av.open(str(video_path)) as container:
-            stream = container.streams.video[0]
+            stream = select_video_stream(container)
             time_base = stream.time_base
             if time_base is None:
                 return None
@@ -473,7 +475,7 @@ def probe_video_dimensions(video_path) -> Optional[tuple]:
         import av
 
         with av.open(str(_validate_local_video_source(video_path))) as container:
-            stream = container.streams.video[0]
+            stream = select_video_stream(container)
             width, height = int(stream.width or 0), int(stream.height or 0)
         if width > 0 and height > 0:
             return width, height
@@ -1012,14 +1014,14 @@ def preprocess_video_av(
 
     container = av.open(str(video_path))
     try:
-        stream = container.streams.video[0]
+        stream = select_video_stream(container)
         stream.thread_type = "AUTO"
 
         source_fps = float(stream.average_rate) if stream.average_rate else 30.0
         frame_step = max(1, round(source_fps * frame_interval)) if frame_interval and frame_interval > 0 else 1
 
         processed = 0
-        for index, frame in enumerate(container.decode(video=0)):
+        for index, frame in enumerate(container.decode(stream)):
             if frame_step > 1 and (index % frame_step) != 0:
                 continue
 
@@ -1093,7 +1095,7 @@ def preprocess_video_av_seek(
     container = av.open(str(video_path))
     worker_owns_container = False
     try:
-        stream = container.streams.video[0]
+        stream = select_video_stream(container)
         # Frame threading accelerates the single keyframe decode per seek.
         stream.thread_type = "AUTO"
 
@@ -1141,7 +1143,7 @@ def preprocess_video_av_seek(
                         if stop.is_set():
                             break
                         frame = None
-                        for f in container.decode(video=0):
+                        for f in container.decode(stream):
                             frame = f
                             break
                     except Exception as exc:

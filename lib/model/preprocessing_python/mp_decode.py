@@ -20,6 +20,8 @@ import os
 import queue
 from typing import Optional
 
+from lib.model.preprocessing_python.video_stream import select_video_stream
+
 _LOGGER = logging.getLogger("logger")
 
 # Frames per dense clip handed to the parent. Purely a transport size.
@@ -83,7 +85,7 @@ def _decode_chunk_worker(path, start_idx, count, frame_interval, max_long_edge,
 
         container = av.open(str(path))
         try:
-            stream = container.streams.video[0]
+            stream = select_video_stream(container)
             thread_type, thread_count = _threading(
                 stream.codec_context.name, bool(dense_sizes), options.get("decode_threads"))
             stream.thread_type = thread_type
@@ -490,7 +492,7 @@ def probe_duration_seconds(path) -> float:
     import av
 
     with av.open(str(path)) as container:
-        stream = container.streams.video[0]
+        stream = select_video_stream(container)
         if stream.duration and stream.time_base:
             return float(stream.duration * stream.time_base)
         if container.duration:
@@ -513,7 +515,7 @@ def probe_frame_order(path, frames: int = ORDER_PROBE_FRAMES):
     seen = []
     try:
         with av.open(str(path)) as container:
-            stream = container.streams.video[0]
+            stream = select_video_stream(container)
             stream.thread_type = "AUTO"
             for frame in container.decode(stream):
                 if frame.pts is None:

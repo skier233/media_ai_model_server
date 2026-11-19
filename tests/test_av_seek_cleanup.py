@@ -10,7 +10,7 @@ from lib.model.preprocessing_python import image_preprocessing as images
 
 class Container:
     def __init__(self, block_second_read=False, fail=False):
-        self.streams = SimpleNamespace(video=[SimpleNamespace(duration=3, time_base=1, average_rate=1)])
+        self.streams = SimpleNamespace(video=[SimpleNamespace(duration=3, time_base=1, average_rate=1, disposition=0)])
         self.reading = threading.Event()
         self.release = threading.Event()
         self.closed = threading.Event()
@@ -29,7 +29,8 @@ class Container:
         if self.fail:
             raise RuntimeError("decode failed")
 
-    def decode(self, **_kwargs):
+    def decode(self, stream):
+        assert stream is self.streams.video[0]
         assert not self.closed.is_set(), "read after close"
         yield SimpleNamespace(to_ndarray=self.to_array)
 

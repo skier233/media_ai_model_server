@@ -39,6 +39,8 @@ from typing import Iterator, Optional, Sequence
 
 import numpy as np
 
+from lib.model.preprocessing_python.video_stream import select_video_stream
+
 logger = logging.getLogger("logger")
 
 # NVDEC cannot decode these; fall back to software rather than fail.
@@ -182,9 +184,10 @@ def probe_video(video_path) -> VideoInfo:
     import av
 
     with av.open(str(video_path)) as container:
-        if not container.streams.video:
-            raise DecodeSetupError(f"No video stream in {video_path}")
-        stream = container.streams.video[0]
+        try:
+            stream = select_video_stream(container)
+        except ValueError as exc:
+            raise DecodeSetupError(f"No video stream in {video_path}: {exc}") from exc
         ctx = stream.codec_context
         fps = float(stream.average_rate) if stream.average_rate else 0.0
         if fps <= 0:
@@ -392,7 +395,8 @@ def build_command(
     command += ["-noautorotate", "-i", str(video_path)]
     # passthrough keeps ffmpeg from duplicating or dropping frames to hit a rate.
     command += ["-fps_mode", "passthrough"] if has_fps_mode else ["-vsync", "passthrough"]
-    command += ["-map", "0:v:0", "-an", "-sn", "-dn"]
+    # Uppercase V excludes attached pictures and thumbnail streams.
+    command += ["-map", "0:V:0", "-an", "-sn", "-dn"]
     if filter_chain:
         command += ["-vf", filter_chain]
     if frames:
@@ -510,9 +514,9 @@ def _iter_pyav_frames(video_path, plan: ScalePlan, frame_step: int) -> Iterator[
     from av.video.reformatter import Interpolation
 
     with av.open(str(video_path)) as container:
-        stream = container.streams.video[0]
+        stream = select_video_stream(container)
         stream.thread_type = "AUTO"
-        for index, frame in enumerate(container.decode(video=0)):
+        for index, frame in enumerate(container.decode(stream)):
             if frame_step > 1 and (index % frame_step) != 0:
                 continue
             if plan.crop:
